@@ -13,7 +13,14 @@ Run everything from \<ROOT\> which has both `SPL` and `baseline_spl` repos insid
 ```bash
 cd <ROOT>
 BASELINE_CONFIG=my_experiment python -m baseline_spl.VLM.cap.run                    # Code-as-Policies
-BASELINE_CONFIG=my_experiment python -m baseline_spl.VLM.demo2code.spl_baseline.run # Demo2Code
+BASELINE_CONFIG=my_experiment python -m baseline_spl.VLM.demo2code.run              # Demo2Code
+```
+
+Demo2Code's released code is a git submodule, so clone with it:
+```bash
+git clone --recurse-submodules <url> baseline_spl
+# already cloned without it:
+git submodule update --init --recursive
 ```
 
 `BASELINE_CONFIG` defaults to `default`; an unknown name fails listing what exists.
@@ -73,7 +80,9 @@ common/            shared spine, reused by the VLA/ and neurosymbolic/ baselines
   serialize_text.py    demonstration -> Demo2Code's [Scenario i] text format
   serialize_visual.py  keyframes -> downscaled PNGs for the VLM
 VLM/cap/           Code-as-Policies
-VLM/demo2code/     the authors' clone, UNTOUCHED, plus spl_baseline/ (our adapter)
+VLM/demo2code/     Demo2Code (our adapter)
+third_party/
+  demo2code/       the authors' clone, UNTOUCHED, pinned as a git submodule
 tests/             regression tests (see "Tests" below)
 runs/<config>_<baseline>/   outputs: concept_library.pt, training_metrics.json,
                    inference_metrics.json, learning_times.json, llm_cache/,

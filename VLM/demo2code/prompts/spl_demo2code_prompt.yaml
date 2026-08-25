@@ -1,0 +1,237 @@
+# Demo2Code prompts for SPL's block-construction domain.
+#
+# Schema is the authors' own (see data/tabletop/prompt/demo2code/demo2code_prompt.yaml):
+#   main     : "<system message><end_of_system_message><prompt>"
+#   examples : list of "<user query><end_of_example_user_query><assistant response>"
+#
+# The response tags below are NOT cosmetic. code_gen_helper.is_summarized(),
+# prepare_demo_query() and clean_up_specification() parse for these exact strings, so
+# the recursion terminates and the spec is extracted correctly:
+#   [[Is the new trajectory sufficiently summarized? (yes/no):]]
+#   [[Summarized trajectory:]]
+#   [[Task Specification:]]
+#
+# FAIRNESS: every worked example uses the invented concept `zigzag_lane`, which appears
+# in no train or test split. SPL's own CONCEPT_GENERALIZATION_PROMPT uses the invented
+# `rewot` for the same reason. Never put row / tower / staircase / pyramid / arch_bridge /
+# pins / psi / x in these examples: it would hand the baseline the answer.
+
+prompt_version: spl-v1
+
+stage1:
+  recursive_summarization:
+    main: |
+      You are summarizing a robot demonstration of building a block structure.
+      <end_of_system_message>
+      You are given the keyframes of one demonstration as a trajectory. Each state names the
+      object that moved, its direction relative to the previously placed object
+      (LEFT/RIGHT/FRONT/BEHIND/TOP), and its position on the integer block grid.
+
+      Your job is to compress the trajectory into a shorter description that preserves the
+      CONSTRUCTION PROCEDURE: which objects were placed, in what ORDER, and the spatial
+      relation between consecutive placements. Collapse repeated steps into a single
+      statement of the repetition and its count.
+
+      Then judge whether your summary is already compact enough that no further compression
+      would help. Answer exactly in this format:
+
+      [[Is the new trajectory sufficiently summarized? (yes/no):]]
+      <yes or no>
+      [[Summarized trajectory:]]
+      <your summarized trajectory>
+
+      Do not output anything else.
+    examples:
+      - |
+        [[Input Trajectory:]]
+        [Scenario 1]
+        Construct a zigzag_lane of length 3 using red cube
+
+        State 2:
+        'cube_red_0' has moved
+        'cube_red_0' is at grid cell (0, 0, 0)
+        State 3:
+        'cube_red_1' has moved
+        'cube_red_1' is RIGHT of 'cube_red_0'
+        'cube_red_1' is at grid cell (0, -1, 0)
+        State 4:
+        'cube_red_2' has moved
+        'cube_red_2' is FRONT of 'cube_red_1'
+        'cube_red_2' is at grid cell (-1, -1, 0)
+        <end_of_example_user_query>
+        [[Is the new trajectory sufficiently summarized? (yes/no):]]
+        yes
+        [[Summarized trajectory:]]
+        The robot placed 3 red cubes one at a time, taking them in order.
+        It placed 'cube_red_0' at the starting focus.
+        It then alternated the shift direction between placements: RIGHT before placing
+        'cube_red_1', then FRONT before placing 'cube_red_2'.
+        Total placements: 3, which equals the stated length of 3.
+        The alternation of RIGHT and FRONT between consecutive placements is the pattern.
+
+  summary_2_spec:
+    main: |
+      You are writing a task specification for a robot block-construction program.
+      <end_of_system_message>
+      You are given a high-level goal and one or more summarized demonstrations of the SAME
+      concept, differing only in the value of a numeric argument.
+
+      Write a single specification that describes how to build the concept for ANY value of
+      that argument. State it as a procedure: where construction starts, what is repeated,
+      how many times as a function of the argument, and which direction the focus shifts
+      between placements. Do not describe one demonstration; describe the general rule that
+      both demonstrations are instances of.
+
+      Answer exactly in this format:
+
+      [[Task Specification:]]
+      <your specification>
+      [[end of response]]
+    examples:
+      - |
+        [[High-Level Goal:]]
+        Construct a zigzag_lane of length 3 using red cube
+        [[Trajectories:]]
+        The robot placed 3 red cubes one at a time. It placed the first at the starting
+        focus, then shifted RIGHT and placed the second, then shifted FRONT and placed the
+        third. Total placements: 3, equal to the length.
+
+        The robot placed 4 red cubes one at a time. It placed the first at the starting
+        focus, then shifted RIGHT, FRONT, RIGHT before the second, third and fourth
+        placements respectively. Total placements: 4, equal to the length.
+        <end_of_example_user_query>
+        [[Task Specification:]]
+        To build a zigzag_lane of length n using the given objects:
+        1. Take objects from the provided list in order, one per placement.
+        2. Place the first object at the current focus.
+        3. Repeat n-1 times, for i = 0, 1, 2, ...:
+           a. Shift the focus RIGHT when i is even, and FRONT when i is odd.
+           b. Place the next object at the focus.
+        4. The structure uses exactly n objects and performs exactly n-1 shifts.
+        The defining pattern is that the shift direction alternates between RIGHT and FRONT,
+        starting with RIGHT.
+        [[end of response]]
+
+stage2:
+  spec_2_highlevelcode:
+    main: |
+      You write Python classes that construct spatial block structures for a robot.
+      <end_of_system_message>
+      You are given a task specification and the initialized sketch of the class to write.
+
+      # Action DSL available inside construct()
+
+      The environment keeps a single global FOCUS: a 3-D location where the next object will
+      be placed. These are the only primitives:
+
+          assign_focus(position: list[float] = None, object_id: int = None)
+              Move the focus to an absolute position, or onto an existing object.
+          shift_focus(direction: str)
+              Move the focus one block-step. direction is one of
+              "LEFT", "RIGHT", "FRONT", "BEHIND", "TOP".
+          place_object_at_focus(object_id: int)
+              Place the given object at the current focus. The focus does not move.
+          filter(*attributes) -> list[int]
+              Object ids matching attributes such as ("blue", "cube").
+
+      "TOP" is vertical. Physics is real: place supports before what they hold up.
+
+      # Required class structure
+
+      class <concept_name>:
+          def __init__(self, <arg>: <type>, objects: list)
+          def construct(self)                  # performs the construction
+          @staticmethod
+          def argument_sampler()               # yields tuples of possible arguments
+          @property
+          def plan(self)                       # execution trace, list of action strings
+          @property
+          def blocks(self)                     # objects used
+          @property
+          def substructures(self)              # sub-concepts used
+          @property
+          def key_blocks(self)                 # structurally important blocks
+          @property
+          def actions(self)                    # follow-up assign_focus actions
+
+      # Output rules
+      - The class name and __init__ arguments MUST match the initialized sketch exactly.
+      - construct() must work for ANY value of the numeric argument. Use a loop over it;
+        never hard-code a fixed number of placements.
+      - Output ONLY the class definition inside a fenced code block with NO language tag,
+        i.e. three backticks, newline, code, newline, three backticks.
+      - No explanation, no example usage.
+    examples:
+      - |
+        ```
+        """
+        To build a zigzag_lane of length n using the given objects:
+        1. Take objects from the provided list in order, one per placement.
+        2. Place the first object at the current focus.
+        3. Repeat n-1 times, for i = 0, 1, 2, ...:
+           a. Shift the focus RIGHT when i is even, and FRONT when i is odd.
+           b. Place the next object at the focus.
+        """
+        ```
+        Initialized sketch:
+        ```
+        zigzag_lane_1 = zigzag_lane(length=3, objects=[4, 5, 6, 7, 8])
+        zigzag_lane_1.construct()
+        ```
+        <end_of_example_user_query>
+        ```
+        class zigzag_lane:
+            def __init__(self, length: int, objects: list):
+                self.length = length
+                self.objects = list(objects) if objects is not None else []
+                self.constructed = False
+
+                self._plan = []
+                self._placed = []
+                self._substructures = []
+
+            def construct(self):
+                if self.constructed:
+                    raise Exception("Construct method has already been called for this instance.")
+                self.constructed = True
+
+                if len(self.objects) < self.length:
+                    raise ValueError(f"Not enough objects for a zigzag_lane of length {self.length}")
+
+                for i in range(self.length):
+                    obj = self.objects.pop(0)
+                    place_object_at_focus(obj)
+                    self._plan.append(f"place_object_at_focus(object_id = {obj})")
+                    self._placed.append(obj)
+                    if i < self.length - 1:
+                        direction = "RIGHT" if i % 2 == 0 else "FRONT"
+                        shift_focus(direction)
+                        self._plan.append(f'shift_focus("{direction}")')
+
+            @staticmethod
+            def argument_sampler():
+                for length in range(1, 1001):
+                    yield (length, None)
+
+            @property
+            def plan(self):
+                return list(self._plan)
+
+            @property
+            def blocks(self):
+                return list(self._placed)
+
+            @property
+            def substructures(self):
+                return list(self._substructures)
+
+            @property
+            def key_blocks(self):
+                if not self._placed:
+                    return []
+                return [self._placed[0]] if len(self._placed) == 1 else [self._placed[0], self._placed[-1]]
+
+            @property
+            def actions(self):
+                return [f"assign_focus(object_id = {b})" for b in self.key_blocks]
+        ```

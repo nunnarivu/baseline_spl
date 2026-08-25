@@ -5,7 +5,7 @@ Code-as-Policies' signature move: hierarchical code generation.
 
 When the generated program calls a helper it never defined, CaP asks the LLM to write
 that helper, then recurses into the helper's own body. Upstream's implementation lives
-in ``VLM/demo2code/scripts/overall_helpers/lmp.py:LMPFGen``; it is reimplemented here
+in ``third_party/demo2code/scripts/overall_helpers/lmp.py:LMPFGen``; it is reimplemented here
 rather than imported because upstream hard-codes robotouille output paths and
 star-imports ``shapely``/``astunparse`` for machinery we do not use. The algorithm —
 parse for undefined calls, generate each, recurse one level deeper — follows it.

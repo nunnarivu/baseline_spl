@@ -4,7 +4,7 @@ llm_backend.py
 A drop-in replacement for Demo2Code's ``call_openai_api`` that routes through SPL's
 own ``openaiClient``.
 
-Upstream (``VLM/demo2code/scripts/overall_helpers/openai_helper.py``) hard-codes
+Upstream (``third_party/demo2code/scripts/overall_helpers/openai_helper.py``) hard-codes
 ``gpt-3.5-turbo`` / ``gpt-3.5-turbo-16k`` and talks to the SDK directly. We keep its
 message assembly byte-for-byte — system message split on ``<end_of_system_message>``,
 few-shot examples split on ``<end_of_example_user_query>`` into alternating
@@ -293,7 +293,7 @@ def load_upstream_code_generator(backend: LLMBackend, configs=None):
     import types
     from baseline_spl.common.config import BASELINE_ROOT
 
-    upstream = BASELINE_ROOT / "VLM" / "demo2code"
+    upstream = BASELINE_ROOT / "third_party" / "demo2code"
     if not (upstream / "scripts").is_dir():
         raise FileNotFoundError(f"Demo2Code clone not found at {upstream}")
     if str(upstream) not in sys.path:
