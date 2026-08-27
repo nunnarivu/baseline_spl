@@ -112,3 +112,34 @@ class Demo2CodeConfig(CommonConfig):
     # 'text': symbolic state + the authors' staged recursive summarization.
     # 'vlm':  keyframe images summarized by a vision model, with no 3-D state.
     variant = "text"
+
+
+class SayCanConfig(CommonConfig):
+    '''SayCan (Ahn et al., 2022): one primitive at a time, no program. The control for
+    whether a program is needed at all.
+
+    sketch_mode is ignored — SayCan emits actions, so there is no signature to give it.
+    '''
+
+    # How the demonstrations are shown: the serialized [Scenario i] block, or the images.
+    demo_modality = "text"
+
+    # Per-action scoring, or one call for the whole plan.
+    #   True  : SayCan proper — score every action from the current state, execute the
+    #           best, re-ask. One LLM call per action, so cost scales with structure size.
+    #   False : one call emits the whole plan. The model never sees the state its own
+    #           actions produced, so nothing corrects a plan that drifts.
+    # Set separately per phase: learning touches num_demos_per_concept demos, inference
+    # touches the whole test set, so inference is where the per-action cost lands. When
+    # these differ, say so in the results — plans cached per-step are then reused as
+    # worked examples by a one-shot call, and the two modes are not interchangeable.
+    recursive_learn = True
+    recursive_infer = True
+
+    # Cap on actions per instruction. Nothing stops the loop on its own — the executor's
+    # _is_terminal is always False at inference — so this and the done() action are what
+    # end it. Generous enough for the longest structures; a run that hits it says so.
+    max_steps = 40
+
+    # Cached plans from earlier instructions, shown as worked examples.
+    plan_library_top_k = 3

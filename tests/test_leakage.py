@@ -87,12 +87,26 @@ class GuardedDemo(dict):
         return super().get(key, default)
 
 
+class FakeConversation:
+    def __init__(self, backend, system_message, images=None):
+        self.backend = backend
+        self.system_message = system_message
+        self.images = images
+
+    def ask(self, user_query, response_format=None, max_tokens=None):
+        self.backend.prompts.append(user_query)
+        return f"```python\n{self.backend.code}\n```"
+
+
 class FakeBackend:
     '''Returns a canned valid class; records prompts. No network.'''
 
     def __init__(self, code=VALID_CLASS):
         self.code = code
         self.prompts = []
+
+    def start_conversation(self, system_message, images=None, model=None):
+        return FakeConversation(self, system_message, images)
 
     def call_text(self, system_message, user_query, max_tokens=None):
         self.prompts.append(user_query)

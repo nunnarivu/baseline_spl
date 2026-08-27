@@ -43,5 +43,6 @@ _module = load(ACTIVE_CONFIG)
 CommonConfig = _module.CommonConfig
 CapConfig = _module.CapConfig
 Demo2CodeConfig = _module.Demo2CodeConfig
+SayCanConfig = _module.SayCanConfig
 CODEGEN_MODEL = _module.CODEGEN_MODEL
 VLM_MODEL = _module.VLM_MODEL

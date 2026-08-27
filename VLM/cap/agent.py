@@ -112,7 +112,6 @@ class CodeAsPoliciesAgent:
             images=images,
             log=log,
         )
-        breakpoint()
 
         if code is None:
             return None

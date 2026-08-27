@@ -37,6 +37,10 @@ objects at it. These four calls are the only primitives:
     assign_focus(position: list[float] = None, object_id: int = None)
         Move the focus to an absolute position, or onto an existing object's location.
         Exactly one of the two arguments is given.
+        Callable inside construct(), not only from the `actions` property: use
+        assign_focus(object_id=<a block you already placed>) to jump the focus back to
+        part of the structure and start a new part from there, instead of shifting all
+        the way back one step at a time.
 
     shift_focus(direction: str)
         Move the focus along the direction. The focus position will move along the direction and the uncertainity will be updated. 
@@ -167,9 +171,12 @@ def build_library_block(concept_library) -> str:
     if not rendered:
         return ""
     return (f"{rendered}\n\n"
-            "You may call any of these concepts inside construct() to build part of this "
-            "structure, exactly as shown above. Reuse one when the structure genuinely "
-            "contains it; otherwise place blocks directly.\n")
+            "PREFER REUSE. If this structure contains one of the concepts above as a part, "
+            "instantiate it and call its construct() from inside your construct(), instead "
+            "of re-deriving the same placements block by block. Call it exactly as shown, "
+            "pass it the objects it needs, and append the instance to self._substructures "
+            "so the decomposition is recorded. Place blocks directly only for the parts no "
+            "library concept covers.\n")
 
 
 def build_task_block(demo_specs) -> str:
@@ -244,6 +251,13 @@ def build_system_prompt(stats_block: str = "", require_signature: bool = True,
     stats = f"{stats_block}\n" if stats_block else ""
     library = f"{library_block}\n" if library_block else ""
     rules = OUTPUT_RULES if require_signature else NO_SKETCH_RULES
+    if library_block:
+        # Repeated here, not only in the library section: the rules are the last thing
+        # before the model writes, and the library section on its own was being ignored.
+        # Conditional, because with an empty library it would point at nothing.
+        rules += ("- Reuse the library concepts listed above wherever this structure "
+                  "contains one, instead of re-deriving their placements; record each "
+                  "instance you build in substructures.\n")
     return (
         "You write Python classes that construct spatial block structures for a robot.\n\n"
         f"{DSL_DOC}\n"

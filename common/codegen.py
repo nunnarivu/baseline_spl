@@ -114,16 +114,17 @@ def generate_with_retries(backend, system_prompt: str, user_prompt: str, *,
 
     Output: the validated class source, or None if every attempt failed to parse.
     '''
+    # One conversation: the task, the demonstration and any images go out once, and a
+    # retry sends only what was wrong. Resending everything would repeat a ~2,300-token
+    # system prompt and every keyframe on each of the four attempts, and would also
+    # diverge from SPL, whose GeneralizeAgent chains its retries the same way.
+    conversation = backend.start_conversation(system_prompt, images=images)
     prompt = user_prompt
     last_error = None
 
     for attempt in range(max_retries + 1):
         try:
-            if images:
-                response = backend.call_vlm(system_prompt, prompt, images,
-                                            max_tokens=max_tokens)
-            else:
-                response = backend.call_text(system_prompt, prompt, max_tokens=max_tokens)
+            response = conversation.ask(prompt, max_tokens=max_tokens)
         except Exception as exc:  # noqa: BLE001
             log(f"[codegen] LLM call failed on attempt {attempt + 1}: {exc}")
             last_error = exc
@@ -143,10 +144,9 @@ def generate_with_retries(backend, system_prompt: str, user_prompt: str, *,
             if attempt >= max_retries:
                 break
             log(f"[codegen] attempt {attempt + 1}/{max_retries + 1} invalid: {exc}")
-            prompt = (f"{user_prompt}\n\n"
-                      f"# Your previous answer was rejected\n"
-                      f"{GeneralizeAgent._build_retry_prompt(exc)}\n\n"
-                      f"Previous answer:\n```python\n{locals().get('code', response)[:4000]}\n```")
+            # Only the correction: the conversation still holds the task and the answer.
+            prompt = (f"# Your previous answer was rejected\n"
+                      f"{GeneralizeAgent._build_retry_prompt(exc)}")
 
     log(f"[codegen] giving up after {max_retries + 1} attempts. Last error: {last_error}")
     return None

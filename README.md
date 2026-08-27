@@ -37,6 +37,14 @@ baseline part spells out the condition — `simple_exp_cap_images_nosketch`,
 | **CaP (images)** | instruction + keyframe **images** | `use_demo = True`, `demo_modality = "images"` |
 | **Demo2Code-text** | instruction + symbolic state, staged summarization (upstream-faithful) | `Demo2CodeConfig.variant = "text"` |
 | **Demo2Code-VLM** | instruction + keyframe **images**, summarized by a vision model | `Demo2CodeConfig.variant = "vlm"` |
+| **SayCan** | demonstrations + one primitive at a time, **no program** | `python -m baseline_spl.VLM.saycan.run` |
+
+SayCan is the control for whether a program is needed at all: it scores the available
+primitives at each step and executes the best, so `row(5)` needs five placements chosen
+separately and `row(11)` eleven. It reports every metric the others do except
+`program_accuracy`, which is recorded as `null` with verdict `"no_program"` — the blank
+column is the finding, not a failure. `recursive_learn` / `recursive_infer` swap the
+per-step loop for a single call that emits the whole plan (see Cost, below).
 
 Crossed with that, `sketch_mode` controls what signature information reaches program
 generation:
@@ -81,6 +89,7 @@ common/            shared spine, reused by the VLA/ and neurosymbolic/ baselines
   serialize_visual.py  keyframes -> downscaled PNGs for the VLM
 VLM/cap/           Code-as-Policies
 VLM/demo2code/     Demo2Code (our adapter)
+VLM/saycan/        SayCan: step-by-step primitives, no program
 third_party/
   demo2code/       the authors' clone, UNTOUCHED, pinned as a git submodule
 tests/             regression tests (see "Tests" below)
@@ -184,6 +193,24 @@ processing. If a run seems hung with no output, check this first.
 - Long demos (`arch_bridge` has 31 keyframes) cost a lot of image tokens in the VLM
   variant. `vlm_max_keyframes` subsamples as a last resort and warns loudly, because every
   keyframe here is a placement.
+- **SayCan's `stop_reason` needs reading alongside its scores.** The loop ends on `done`,
+  `all_placed` or `max_steps`. Only `done` is the agent judging the structure finished;
+  `all_placed` means `objects.pop(0)` ran out, and when a scene holds exactly as many
+  blocks as the structure needs (`row(5)` with 5 objects) that hands it the count for free.
+  It is recorded per instruction so a run cannot look like counting when it was not.
+- SayCan costs one LLM call **per action**, so ~8-10 per instruction against 1-4 per
+  *concept* for the program baselines. Check the token ledger after one concept before a
+  sweep. `max_steps` caps the worst case.
+- **`recursive_learn` / `recursive_infer = False`** drops that to one call per instruction:
+  the model emits the whole plan at once and it is executed in order (`stop_reason`
+  `plan_complete`, or `no_plan` if nothing parseable came back). Still program-free, so it
+  answers the same research question — but the model never sees the state its own actions
+  produced, so a drifting plan is never corrected. The knobs are separate because learning
+  touches `num_demos_per_concept` demos while inference touches the whole test set, so
+  inference is where the per-action cost lands; `recursive_learn=True` with
+  `recursive_infer=False` buys most of the saving. Say which mode each reported number came
+  from, and note the asymmetry when they differ — plans cached per-step are then reused as
+  worked examples by a one-shot call. Do not mix the two in one column.
 
 ## Tests
 
@@ -191,6 +218,7 @@ processing. If a run seems hung with no output, check this first.
 python -m baseline_spl.tests.test_leakage     # fairness invariants, per-demo prompt content
 python -m baseline_spl.tests.test_serialize   # direction mapping, SRN agreement, both coordinate modes
 python -m baseline_spl.tests.test_resume      # which library gets loaded; metric merging
+python -m baseline_spl.tests.test_saycan      # flat-plan scoring and all three stop conditions
 ```
 
 `test_serialize` is the important one: it guards constants that, if wrong, silently make

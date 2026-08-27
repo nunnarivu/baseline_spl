@@ -51,6 +51,53 @@ def _messages_from_upstream_prompt(main_prompt: str,
     return messages
 
 
+class Conversation:
+    '''A multi-turn exchange where only the first turn carries the bulky context.
+
+    The demonstration — serialized text, or a dozen keyframe images — is sent once. Later
+    turns send just the new question and continue server-side via ``previous_response_id``,
+    which is what SPL's own ``GeneralizeAgent`` does for its retries.
+
+    ``ask`` returns "" if the model gives nothing back; the caller decides what that means.
+    '''
+
+    def __init__(self, backend: "LLMBackend", system_message: str,
+                 images: Optional[Sequence[bytes]] = None, model: Optional[str] = None):
+        self.backend = backend
+        self.system_message = system_message
+        self.pending_images = list(images) if images else None
+        self.model = model or (backend.vlm_model if images else backend.model)
+        self.previous_response_id: Optional[str] = None
+        self.turns = 0
+
+    def ask(self, user_query: str, *, response_format=None, max_tokens: int = 4000) -> str:
+        first = self.previous_response_id is None
+        messages = ([{"role": "system", "content": self.system_message},
+                     {"role": "user", "content": user_query}] if first
+                    else [{"role": "user", "content": user_query}])
+        params: Dict[str, Any] = {"max_output_tokens": max_tokens}
+        if response_format is not None:
+            params["response_format"] = response_format
+
+        text = self.backend._request(
+            messages, params, model=self.model, endpoint="responses",
+            images=self.pending_images if first else None,
+            previous_response_id=self.previous_response_id)
+
+        self.previous_response_id = self.backend.last_response_id
+        self.turns += 1
+        if self.previous_response_id is not None:
+            # Sent once; the server-side conversation carries them from here.
+            self.pending_images = None
+        else:
+            # No id came back (a cache hit, or the endpoint did not return one), so the
+            # next turn cannot continue this one. Keep the context so it re-sends rather
+            # than asking a contextless question.
+            warnings.warn("[Conversation] no response id returned; the next turn will "
+                          "re-send the full context instead of continuing.")
+        return text
+
+
 class LLMBackend:
     '''Cached, token-accounting LLM/VLM backend shared by every baseline.
 
@@ -79,6 +126,8 @@ class LLMBackend:
         self.completion_tokens = 0
         self.num_calls = 0
         self.num_cache_hits = 0
+        # Id of the most recent turn, for continuing it as a conversation.
+        self.last_response_id: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     # Cache
@@ -115,12 +164,23 @@ class LLMBackend:
     # Core request
     # ------------------------------------------------------------------ #
     def _request(self, messages: list, params: dict, *, model: str, endpoint: str,
-                 images: Optional[Sequence[bytes]] = None) -> str:
+                 images: Optional[Sequence[bytes]] = None,
+                 previous_response_id: Optional[str] = None,
+                 use_cache: bool = True) -> str:
+        '''``previous_response_id`` continues a server-side conversation, so the caller
+        sends only the new turn. It is Responses-endpoint only. Such turns are not cached:
+        a cached reply cannot resume a conversation that has since expired.'''
         image_digests = [hashlib.sha1(im).hexdigest() for im in (images or [])]
+        cacheable = use_cache and previous_response_id is None
         key = self._key(model, messages, params, image_digests)
-        if key in self._cache:
+        if cacheable and key in self._cache:
             self.num_cache_hits += 1
+            self.last_response_id = None
             return self._cache[key]["text"]
+
+        if previous_response_id is not None:
+            params = self._retarget_params(params, "responses")
+            endpoint = "responses"
 
         attempt_params = dict(params)
         attempt_endpoint = endpoint
@@ -131,6 +191,7 @@ class LLMBackend:
                     messages=messages,
                     model=model,
                     images=list(images) if images else None,
+                    previous_response_id=previous_response_id,
                     endpoint=attempt_endpoint,
                     return_raw=True,
                     **attempt_params,
@@ -154,6 +215,9 @@ class LLMBackend:
         else:
             raise RuntimeError(f"[LLMBackend] exhausted parameter retries: {last_exc}")
 
+        # Recorded so a caller can continue this turn as a conversation.
+        self.last_response_id = getattr(self.client, "last_response_id", None)
+
         text, usage = self._extract(response, attempt_endpoint)
         if not text:
             # Reasoning models can spend the whole budget on hidden reasoning tokens and
@@ -167,8 +231,9 @@ class LLMBackend:
             self.prompt_tokens += usage.get("prompt_tokens", 0)
             self.completion_tokens += usage.get("completion_tokens", 0)
 
-        self._cache[key] = {"text": text, "usage": usage, "model": model}
-        self._save_cache()
+        if cacheable:
+            self._cache[key] = {"text": text, "usage": usage, "model": model}
+            self._save_cache()
         return text
 
     @staticmethod
@@ -257,6 +322,16 @@ class LLMBackend:
                                   if self.model.startswith(_ALWAYS_STRIP_PREFIXES)
                                   else {"max_tokens": max_tokens})
         return self._request(messages, params, model=self.model, endpoint="chat")
+
+    def start_conversation(self, system_message: str,
+                           images: Optional[Sequence[bytes]] = None,
+                           model: Optional[str] = None) -> Conversation:
+        '''Begin a multi-turn exchange whose bulky context is sent only once.
+
+        Used by SayCan (demonstration once, then a turn per action) and by
+        ``codegen.generate_with_retries`` (task once, then only the correction).
+        '''
+        return Conversation(self, system_message, images=images, model=model)
 
     def call_vlm(self, system_message: str, user_query: str, images: Sequence[bytes],
                  *, max_tokens: int = 6000) -> str:

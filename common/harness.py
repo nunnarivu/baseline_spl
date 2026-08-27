@@ -169,7 +169,6 @@ class BaselineHarness:
         record = {"concept": gt_concept, "pred_concept": concept_name,
                   "status": status, **metrics}
         self._metric_records[gt_concept] = record
-        breakpoint()
 
         self._time_records[gt_concept] = {
             "concept": gt_concept,
@@ -314,6 +313,12 @@ class BaselineHarness:
 
         self._write_inference_metrics(records)
 
+    def program_equivalence(self, record: dict) -> dict:
+        '''Is the learned program correct for every argument? A hook so a baseline that
+        produces no program (SayCan) can say so, instead of it looking like a failed check.'''
+        return self.spl._check_program_equivalence(
+            record.get("pred_concept", record.get("concept")), record.get("_demo") or {})
+
     def _write_inference_metrics(self, records: List[dict]) -> None:
         cfg = self.configs
         keys = cfg.evaluation_config.metric_keys
@@ -331,8 +336,7 @@ class BaselineHarness:
                        for c, rs in by_concept.items()}
         # program_accuracy is a property of the concept, not of one demo.
         for c, rs in by_concept.items():
-            eq = self.spl._check_program_equivalence(rs[0].get("pred_concept", c),
-                                                     rs[0].get("_demo") or {})
+            eq = self.program_equivalence(rs[0])
             per_concept[c].update({k: v for k, v in eq.items() if k != "program_accuracy"})
             per_concept[c]["program_accuracy"] = eq.get("program_accuracy")
 

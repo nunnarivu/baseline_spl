@@ -29,7 +29,7 @@ class CommonConfig:
     # Data. Use ALL_CONCEPTS for the full sweep. row/tower are smoke-test concepts —
     # an LLM already knows them, so they test plumbing, not capability; pins, psi,
     # arch_bridge and x are the ones that discriminate.
-    concepts = ["row", "tower", "staircase", "pyramid", "arch_bridge"]
+    concepts = ["row",  "tower", "staircase", "pyramid", "arch_bridge"]
     num_demos_per_concept = 2
     num_workers = 4
 
@@ -51,7 +51,7 @@ class CommonConfig:
     #   'none'      : nothing — the model picks the class name and arguments itself.
     #                 The sketch still runs afterwards, against the now-registered class,
     #                 to produce the instantiations; inference is unchanged either way.
-    sketch_mode = "none"
+    sketch_mode = "corrected"
 
     # How a placement's position is written in the serialized demonstration.
     #   'lattice' : integer grid cell, e.g. (0, -1, 0)
@@ -71,7 +71,7 @@ class CommonConfig:
 
     # Output directory under runs/. None means use the config file's own name, so two
     # configs can never overwrite each other's results.
-    run_name = "test_dry_run"
+    run_name = "cap_text_sketch_dry_run"
 
 
 class CapConfig(CommonConfig):
@@ -86,7 +86,7 @@ class CapConfig(CommonConfig):
     # How the demonstration is shown when use_demo is True.
     #   'text'   : the serialized [Scenario i] block, as Demo2Code receives it
     #   'images' : the keyframe images, passed into the single code-generation call
-    demo_modality = "images"
+    demo_modality = "text"
 
     # Depth limit for CaP's recursive generation of helpers the code calls but
     # never defines.
@@ -99,3 +99,34 @@ class Demo2CodeConfig(CommonConfig):
     # 'text': symbolic state + the authors' staged recursive summarization.
     # 'vlm':  keyframe images summarized by a vision model, with no 3-D state.
     variant = "text"
+
+
+class SayCanConfig(CommonConfig):
+    '''SayCan (Ahn et al., 2022): one primitive at a time, no program. The control for
+    whether a program is needed at all.
+
+    sketch_mode is ignored — SayCan emits actions, so there is no signature to give it.
+    '''
+
+    # How the demonstrations are shown: "text" : the serialized [Scenario i] block, or the "images".
+    demo_modality = "images"
+
+    # Per-action scoring, or one call for the whole plan.
+    #   True  : SayCan proper — score every action from the current state, execute the
+    #           best, re-ask. One LLM call per action, so cost scales with structure size.
+    #   False : one call emits the whole plan. The model never sees the state its own
+    #           actions produced, so nothing corrects a plan that drifts.
+    # Set separately per phase: learning touches num_demos_per_concept demos, inference
+    # touches the whole test set, so inference is where the per-action cost lands. When
+    # these differ, say so in the results — plans cached per-step are then reused as
+    # worked examples by a one-shot call, and the two modes are not interchangeable.
+    recursive_learn = True
+    recursive_infer = False
+
+    # Cap on actions per instruction. Nothing stops the loop on its own — the executor's
+    # _is_terminal is always False at inference — so this and the done() action are what
+    # end it. Generous enough for the longest structures; a run that hits it says so.
+    max_steps = 40
+
+    # Cached plans from earlier instructions, shown as worked examples.
+    plan_library_top_k = 3

@@ -58,9 +58,11 @@ class SharedSketch:
 
         Used by the no-sketch condition: the class is registered first, so the sketch
         agent sees its name and argument names in context (``_similar_concepts`` scores
-        against exactly those) and should ground the instruction onto it. A mismatch or an
-        error is retried with the cache bypassed, so the retry genuinely re-asks instead of
-        replaying the same cached answer.
+        against exactly those) and should ground the instruction onto it.
+
+        The cache is keyed by instruction alone, so an entry written against a previous
+        run's class name is stale under sketch_mode="none", where the name changes on
+        every relearn. A mismatch drops that entry and bypasses the cache for the retry.
 
         Returns None (with a warning) if it never grounds, so the caller can carry on with
         the demonstrations that did.
@@ -80,6 +82,7 @@ class SharedSketch:
                         return info
                     problem = (f"sketch produced {info.get('concept')}({sorted(got)}), "
                                f"expected {concept}({sorted(expected)})")
+                self._drop_stale(instruction, log)
                 if attempt < retries:
                     log(f"[sketch] {problem}; re-asking ({attempt + 1}/{retries})")
                     self.agent.use_cache = False   # otherwise the retry replays the cache
@@ -89,6 +92,16 @@ class SharedSketch:
         log(f"[sketch] WARNING could not ground '{instruction}' onto {concept}: {problem}. "
             f"Skipping this demonstration's metrics.")
         return None
+
+    def _drop_stale(self, instruction: str, log=print) -> None:
+        '''Remove a cached sketch that failed to ground. Done on the last attempt too:
+        the agent re-caches what it just produced, and a wrong answer left behind would
+        be served to the next run without ever reaching the LLM.'''
+        try:
+            if self.agent.remove_cache(instruction):
+                log(f"[sketch] dropped the stale cached sketch for '{instruction}'")
+        except Exception as exc:  # noqa: BLE001
+            log(f"[sketch] could not drop the cached sketch for '{instruction}': {exc}")
 
     def initialized_sketch(self, sketch_info: Dict[str, Any]) -> str:
         '''The two-line ``<concept>_1 = <concept>(...)`` / ``.construct()`` snippet,
