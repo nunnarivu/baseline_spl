@@ -44,5 +44,8 @@ CommonConfig = _module.CommonConfig
 CapConfig = _module.CapConfig
 Demo2CodeConfig = _module.Demo2CodeConfig
 SayCanConfig = _module.SayCanConfig
+# Config files predating the symbolic baselines do not define these.
+DreamCoderConfig = getattr(_module, "DreamCoderConfig", None)
+LiloConfig = getattr(_module, "LiloConfig", None)
 CODEGEN_MODEL = _module.CODEGEN_MODEL
 VLM_MODEL = _module.VLM_MODEL

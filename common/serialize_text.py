@@ -95,7 +95,17 @@ def estimate_pitch(demos: Sequence[dict]) -> tuple:
     '''Estimate (horizontal, vertical) lattice pitch from the demonstrations themselves,
     so the rendering adapts if the assets or spacing change. Falls back to the measured
     constants for whichever axis a demo never exercises (a tower has no horizontal
-    steps, a row no vertical ones).'''
+    steps, a row no vertical ones).
+
+    The pitch is the *unit* step, so it can only be measured from a demonstration that
+    actually takes one. ``pins`` never does -- it moves ``shift right; shift right; place``,
+    so every consecutive pair of placements is two cells apart and the naive estimate comes
+    out at 0.221 m, exactly twice the true 0.109. Every cell it produced was then halved.
+    No statistic over pins' own deltas can recover the unit (they are all doubled), so when
+    the estimate is an implausible multiple of the expected pitch we fall back to the
+    constant. Passing several concepts' demos at once avoids the situation entirely, because
+    most concepts do take single steps.
+    '''
     horizontal, vertical = [], []
     for demo in demos:
         meshes = demo.get("meshes") or []
@@ -113,8 +123,15 @@ def estimate_pitch(demos: Sequence[dict]) -> tuple:
                 elif planar < 0.02 and delta[2] > 0.02:
                     vertical.append(float(delta[2]))
             previous = obj
-    return (float(np.median(horizontal)) if horizontal else HORIZONTAL_PITCH,
-            float(np.median(vertical)) if vertical else VERTICAL_PITCH)
+    h = float(np.median(horizontal)) if horizontal else HORIZONTAL_PITCH
+    v = float(np.median(vertical)) if vertical else VERTICAL_PITCH
+
+    # Implausible multiples mean no demo took a unit step on that axis (see the docstring).
+    if h > 1.5 * HORIZONTAL_PITCH:
+        h = HORIZONTAL_PITCH
+    if v > 1.5 * VERTICAL_PITCH:
+        v = VERTICAL_PITCH
+    return h, v
 
 
 def _lattice(centroid: np.ndarray, origin: np.ndarray, pitch: tuple) -> tuple:

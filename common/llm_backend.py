@@ -263,7 +263,7 @@ class LLMBackend:
         if "max_tokens" in lowered and "max_completion_tokens" in lowered and "max_tokens" in params:
             params["max_completion_tokens"] = params.pop("max_tokens")
             return "max_tokens -> max_completion_tokens"
-        for name in ("temperature", "stop", "max_tokens", "max_completion_tokens", "top_p"):
+        for name in ("temperature", "stop", "max_tokens", "max_completion_tokens", "top_p", "n"):
             if name in lowered and name in params:
                 params.pop(name)
                 return name
@@ -322,6 +322,89 @@ class LLMBackend:
                                   if self.model.startswith(_ALWAYS_STRIP_PREFIXES)
                                   else {"max_tokens": max_tokens})
         return self._request(messages, params, model=self.model, endpoint="chat")
+
+    def call_messages_sampled(self, messages: list, *, n: int = 1,
+                              temperature: Optional[float] = None,
+                              stop: Optional[str] = None,
+                              images: Optional[Sequence[bytes]] = None,
+                              max_tokens: int = 3000) -> List[str]:
+        '''Several completions from ONE request, for LILO's ``n_samples_per_query``.
+
+        Upstream draws n samples per query through the API's own ``n`` parameter
+        (``sample_generator.py:540-548``), not by asking the model for n programs in one
+        reply. Repeating the request instead would be worse than merely unfaithful here:
+        identical prompts hit the response cache and would return identical text.
+
+        Kept separate from ``call_text`` rather than added as a parameter, so every existing
+        caller and its cached responses are untouched. Returns one string per completion; a
+        model that refuses ``n`` degrades to a single completion rather than failing.
+        '''
+        # A vision-capable model when images are attached, matching `Conversation`'s rule
+        # and the other baselines' image paths. With the default config both names resolve
+        # to the same model, so parity is unaffected.
+        model = self.vlm_model if images else self.model
+        params: Dict[str, Any] = ({"max_completion_tokens": max_tokens}
+                                  if model.startswith(_ALWAYS_STRIP_PREFIXES)
+                                  else {"max_tokens": max_tokens})
+        if n > 1:
+            params["n"] = n
+        if temperature is not None and not model.startswith(_ALWAYS_STRIP_PREFIXES):
+            params["temperature"] = temperature
+        # LILO passes stop="\n" (gpt_base.py:361) so one completion is one line. The
+        # reasoning families reject it, and _strip_rejected_param drops it if the API
+        # complains -- the caller must therefore not depend on it being honoured.
+        if stop and not model.startswith(_ALWAYS_STRIP_PREFIXES):
+            params["stop"] = stop
+
+        # Images participate in the cache key by digest, so a modality change is a cache
+        # miss rather than a silently reused text-only completion.
+        image_digests = [hashlib.sha1(im).hexdigest() for im in (images or [])]
+        key = self._key(model, messages, params, image_digests)
+        if key in self._cache:
+            self.num_cache_hits += 1
+            self.last_response_id = None
+            entry = self._cache[key]
+            # Entries written by this method carry a list; tolerate a plain string so a
+            # cache shared with call_text can never crash a run.
+            texts = entry.get("texts")
+            return list(texts) if texts is not None else [entry["text"]]
+
+        attempt = dict(params)
+        last_exc = None
+        for _ in range(8):
+            try:
+                response = self.client.generate_response(
+                    messages=messages, model=model, endpoint="chat",
+                    images=list(images) if images else None,
+                    return_raw=True, **attempt)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                dropped = self._strip_rejected_param(attempt, str(exc))
+                if dropped is None:
+                    raise
+                warnings.warn(f"[LLMBackend] {model} rejected '{dropped}'; retrying without it.")
+        else:
+            raise RuntimeError(f"[LLMBackend] exhausted parameter retries: {last_exc}")
+
+        texts = [(c.message.content or "").strip() for c in response.choices]
+        texts = [t for t in texts if t]
+        usage_obj = getattr(response, "usage", None)
+        usage = {}
+        if usage_obj is not None:
+            usage = {"prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
+                     "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0}
+        self.num_calls += 1
+        if not texts:
+            warnings.warn(f"[LLMBackend] {model} returned no content "
+                          f"(usage={usage}); not caching.")
+            return []
+        self.prompt_tokens += usage.get("prompt_tokens", 0)
+        self.completion_tokens += usage.get("completion_tokens", 0)
+        self._cache[key] = {"texts": texts, "text": texts[0], "usage": usage,
+                            "model": model}
+        self._save_cache()
+        return texts
 
     def start_conversation(self, system_message: str,
                            images: Optional[Sequence[bytes]] = None,

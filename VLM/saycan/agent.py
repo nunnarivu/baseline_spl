@@ -292,7 +292,6 @@ class SayCanAgent:
         state = executor.query_current_state()
         fixed = list(action_space.get_primitives(state)) + [DONE]
         preamble = f"{stats_block}\n{context}" if stats_block else context
-        breakpoint()
         conversation = self.backend.start_conversation(f"{ONESHOT_SYSTEM}\n\n{ACTION_DOC}",
                                                        images=images)
         reply = conversation.ask(
@@ -345,7 +344,6 @@ class SayCanAgent:
         context, images = self._context(demos, cached_plans)
         names = list(demos[0].get("object_names") or []) if demos else []
         actions: List[str] = []
-        breakpoint()
         # One conversation per instruction: the demonstrations (and, in the image
         # modality, every keyframe) are sent on the first turn only; each later turn
         # carries just the new state and is continued via previous_response_id.
