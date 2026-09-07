@@ -22,12 +22,13 @@ import numpy as np
 
 from SPL.config.primitive_config import DEFAULT_ACTIONS
 from SPL.dataloader.datasets import build_inductive_structure_dataset
-from baseline_spl.common.serialize_text import (_DIRECTION_VECTORS, demo_to_scenario,
+from baseline_spl.common.serialize_text import (HORIZONTAL_PITCH, _DIRECTION_VECTORS,
+                                                demo_to_scenario, estimate_pitch,
                                                 to_demo2code_text)
 
 DATA_DIR = "/home/nsei/Namas/DATA/structures"
 ASSETS = "/home/nsei/Namas/DATA/assets"
-CONCEPTS = ["row", "tower", "column"]
+CONCEPTS = ["row", "tower", "column", "pins"]
 
 
 def check_direction_table(failures):
@@ -124,6 +125,41 @@ def check_serialization(failures, demos):
     print(to_demo2code_text(demos, coordinate_mode="raw"))
 
 
+def check_pitch_on_double_step_concepts(failures, demos):
+    '''`pins` moves `shift right; shift right; place`, so it never takes a unit horizontal
+    step and the naive estimate came out at exactly twice the true pitch -- halving every
+    cell it produced, in every prompt sent to CaP, Demo2Code-text and SayCan.
+
+    The unit cannot be recovered from pins' own deltas (they are uniformly doubled), so
+    estimate_pitch falls back to the constant when the measurement is an implausible
+    multiple. This checks that guard, and that the resulting cells match the ground-truth
+    program the demonstration was generated from.'''
+    import json
+    import re
+
+    from SPL.utils.metrics import run_gt_program
+
+    horizontal, _vertical = estimate_pitch(demos)
+    if horizontal > 1.5 * HORIZONTAL_PITCH:
+        failures.append(f"pins pitch {horizontal:.4f} is a multiple of {HORIZONTAL_PITCH}; "
+                        f"the estimate_pitch guard did not fire")
+        return
+
+    text = to_demo2code_text(demos[:1], coordinate_mode="lattice")
+    cells = [tuple(int(v) for v in m)
+             for m in re.findall(r"grid cell \((-?\d+), (-?\d+), (-?\d+)\)", text)]
+    meta = json.load(open(f"{DATA_DIR}/{demos[0]['demo_id']}/demo.json"))
+    expected = run_gt_program(meta["program"], len(meta["scene_info"]["object_ids"]))
+
+    if expected is None:
+        failures.append("pins ground-truth program failed to run")
+    elif cells != expected["positions"]:
+        failures.append(f"pins cells disagree with ground truth: "
+                        f"{cells[:4]} vs {expected['positions'][:4]}")
+    else:
+        print(f"  OK   pins pitch {horizontal:.4f} and {len(cells)} cells match ground truth")
+
+
 def main() -> int:
     failures = []
     check_direction_table(failures)
@@ -142,6 +178,12 @@ def main() -> int:
     else:
         check_serialization(failures, rows[:2])
         check_srn_agrees(failures, rows[0])
+
+    pins = by_concept.get("pins", [])
+    if not pins:
+        failures.append("need a 'pins' demonstration for the lattice-pitch check")
+    else:
+        check_pitch_on_double_step_concepts(failures, pins)
 
     print()
     if failures:
