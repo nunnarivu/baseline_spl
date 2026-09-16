@@ -71,6 +71,18 @@ class CommonConfig:
     # Retries per concept class, shared by parse failures and (below) evaluation failures.
     max_code_retries = 3
 
+    # Completion budget for codegen.generate_with_retries and call_vlm. This used to be a
+    # hardcoded 6000, tied to no real limit. Reasoning models (e.g. Qwen3's "thinking" mode)
+    # can spend the whole budget on hidden reasoning and return empty content if cut off
+    # before ever answering -- a large budget makes that far less likely. Qwen's own vLLM
+    # deployment reports a 262144-token max_model_len, which is prompt + completion
+    # combined -- the server hard-rejects (400) a request whose max_tokens leaves no room
+    # for the prompt, and that particular error isn't one LLMBackend's parameter-retry loop
+    # recognizes, so this is deliberately short of the ceiling: 62144 tokens of headroom is
+    # generous next to these calls' actual prompts (a few thousand tokens even with a few
+    # dozen keyframe images).
+    codegen_max_tokens = 200000
+
     # Run each generated class on the demonstrations and retry with a report (crash, block
     # count, per-block distance to the demo's final state, bookkeeping), as SPL's Generalize
     # evaluator does. Passes when every block is within sketch_val_state_error_threshold.

@@ -419,9 +419,11 @@ class LLMBackend:
         return Conversation(self, system_message, images=images, model=model)
 
     def call_vlm(self, system_message: str, user_query: str, images: Sequence[bytes],
-                 *, max_tokens: int = 6000) -> str:
+                 *, max_tokens: Optional[int] = None) -> str:
         '''A vision call. Images are raw PNG bytes; ``openaiClient`` turns them into
         data URIs. Uses the Responses endpoint, which handles image input natively.'''
+        if max_tokens is None:
+            max_tokens = getattr(self.configs, "codegen_max_tokens", 200000)
         messages = [{"role": "system", "content": system_message},
                     {"role": "user", "content": user_query}]
         params = {"max_output_tokens": max_tokens}

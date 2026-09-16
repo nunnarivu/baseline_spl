@@ -179,6 +179,7 @@ class Demo2CodeTextAgent:
              f"```python\n{code[:4000]}\n```\n"),
             wanted_name=concept,
             max_retries=self.configs.max_code_retries,
+            max_tokens=self.configs.codegen_max_tokens,
             evaluator=evaluator,
             log=log,
         )

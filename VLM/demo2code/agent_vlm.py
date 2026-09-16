@@ -163,6 +163,7 @@ class Demo2CodeVLMAgent(Demo2CodeTextAgent):
              f"# Task specification, summarized from the demonstration videos\n{spec}\n"),
             wanted_name=concept,
             max_retries=self.configs.max_code_retries,
+            max_tokens=self.configs.codegen_max_tokens,
             evaluator=evaluator,
             log=log,
         )
