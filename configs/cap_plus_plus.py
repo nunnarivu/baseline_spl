@@ -36,6 +36,9 @@ class CommonConfig:
     codegen_model = CODEGEN_MODEL
     vlm_model = VLM_MODEL
 
+    # Which provider serves codegen_model/vlm_model ('openai' | 'qwen' | 'vertexai' | 'google').
+    llm_provider = "openai"
+
     # OpenAI processing tier for every LLM/VLM call.
     #   'flex'    : cheaper, but requests queue and can take much longer
     #   'default' : standard processing

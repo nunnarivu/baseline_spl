@@ -26,13 +26,23 @@ def available_configs() -> list:
 
 
 def load(name: str = None):
-    '''Import a config module by name, failing with the list of what exists.'''
+    '''Import a config module by name, failing with the list of what exists.
+
+    Falls back to `baseline_spl/tests/configs/`, which holds the smoke and golden configs.
+    Keeping those out of `configs/` means the directory lists the experiments you actually
+    run, not the scaffolding that tests the code.
+    '''
     name = name or os.environ.get("BASELINE_CONFIG") or DEFAULT_CONFIG
     try:
         return importlib.import_module(f"baseline_spl.configs.{name}")
+    except ImportError:
+        pass
+    try:
+        return importlib.import_module(f"baseline_spl.tests.configs.{name}")
     except ImportError as exc:
         raise ImportError(
-            f"BASELINE_CONFIG={name!r} does not name a file in {CONFIG_DIR}. "
+            f"BASELINE_CONFIG={name!r} does not name a file in {CONFIG_DIR} "
+            f"or {CONFIG_DIR.parent / 'tests' / 'configs'}. "
             f"Available: {', '.join(available_configs())}"
         ) from exc
 

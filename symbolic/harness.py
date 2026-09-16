@@ -351,7 +351,8 @@ class SearchHarness(BaselineHarness):
             def gate(candidate, _probe=probe):
                 try:
                     return self.evaluator.accepts(
-                        self.evaluator.score(from_term(candidate, concept_level=True), _probe))
+                        self.evaluator.score(
+                            from_term(candidate, concept_level=_probe.arity), _probe))
                 except Exception:  # noqa: BLE001 - a wrong generalisation may fail any way
                     return False
 
@@ -646,7 +647,7 @@ class SearchHarness(BaselineHarness):
 
             param = next(t for t in tasks if t.name == concept).param_name
             code = lower(solution.term, concept, param)
-            exact, why = saved_is_exact(solution.term)
+            exact, why = saved_is_exact(solution.term, arity=len(_args(param)))
             if not exact:
                 log(f"<{concept}>: WARNING focus restore is not exactly lowerable ({why}); "
                     f"the class may fail on the live executor.")

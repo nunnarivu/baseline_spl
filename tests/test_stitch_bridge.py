@@ -21,8 +21,8 @@ from baseline_spl.symbolic.bridge import CONCEPT_REQUEST, from_term, grammar, to
 from baseline_spl.symbolic.ir import positions
 from baseline_spl.symbolic.lattice import EMPTY
 from baseline_spl.symbolic.oracles import ORACLES
-from baseline_spl.symbolic.stitch_bridge import (best_compression, compress, extend,
-                                                 reweight)
+from baseline_spl.symbolic.stitch_bridge import (best_compression, compress, corpus_mdl,
+                                                 extend, reweight)
 
 # The concepts a real run would have solved first: all four lines, which share the
 # "place, then n-1 times (shift d, place)" skeleton STITCH should lift out.
@@ -151,6 +151,35 @@ def test_reweighting_uses_each_task_own_request():
 
     rewritten = reweight(base, corpus, 1.0, log=None, requests=requests)
     assert rewritten is not base, "re-weighting a closed corpus produced no new grammar"
+
+
+def test_extend_preserves_the_grammars_own_literals():
+    '''`extend` must keep whatever literals the grammar was actually built with, not fall
+    back to the level's default {1, 2}.
+
+    `_literal_ceiling` widens the grammar for every real run (`max(12, 2*largest+1)`, so even
+    concept-level never stays at the {1, 2} default) -- and `extend` used to rebuild via
+    `primitives_for(level) + invented + fresh`, dropping every literal beyond 2 the moment the
+    first abstraction was extracted. After that, `corpus_mdl` on any program using a wider
+    literal hit DreamCoder's own `likelihoodSummary` "not in candidates" path (an unreachable
+    production, not an exception) and returned inf, so `best_compression`'s `score < best_score`
+    was `inf < inf` and NO abstraction was ever kept -- silently, logged only as "no
+    abstraction lowered the corpus description length". Measured live: a demo-level smoke run
+    solved `row` at literal 5, and the very next compression step could not score it again.
+    '''
+    base = grammar("standard", int_literals_upto=13)
+    corpus, requests = _closed_corpus()                         # literals 3, 4, 5
+
+    compression, extended = best_compression(base, corpus, requests=requests)
+    assert compression.abstractions, (
+        "no abstraction found on a corpus with shared structure -- fix the fixture, not the "
+        "assertion below, or this test cannot tell the two failure modes apart")
+
+    literals = {"3", "4", "5"}
+    kept = {str(p) for _l, _t, p in extended.productions} & literals
+    assert kept == literals, f"extend dropped literal(s) {literals - kept}"
+    assert corpus_mdl(extended, corpus, requests) != float("inf"), (
+        "the corpus can no longer be scored under its own compressed grammar")
 
 
 def main() -> int:

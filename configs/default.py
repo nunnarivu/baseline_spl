@@ -46,12 +46,22 @@ class CommonConfig:
     # an LLM already knows them, so they test plumbing, not capability; pins, psi,
     # arch_bridge and x are the ones that discriminate.
     concepts = list(ALL_CONCEPTS)
-    num_demos_per_concept = 2
+    # 3, not 2: 14 of 99 concepts take 2-3 integer arguments, and with only 2 demos a
+    # recovery hole is under-determined (an affine fit of one argument can reproduce another
+    # exactly -- measured: `3*length - 7` equals `breadth` on [(3,2), (4,5)]). At 2 demos
+    # those 14 concepts report `ambiguous` and register nothing; 3 distinct sizes resolves it.
+    num_demos_per_concept = 3
     num_workers = 4
 
     # Models (see the parity note above).
     codegen_model = CODEGEN_MODEL
     vlm_model = VLM_MODEL
+
+    # Which provider serves codegen_model/vlm_model ('openai' | 'qwen' | 'vertexai' | 'google').
+    # Independent of SPL's own GeneralizeConfig.llm_provider — a baseline can point at a
+    # different provider than SPL is currently using, while still reaching it through SPL's
+    # stored connection details (SPL/config/spl_config.py), not a second copy of them.
+    llm_provider = "openai"
 
     # OpenAI processing tier for every LLM/VLM call.
     #   'flex'    : cheaper, but requests queue and can take much longer
@@ -155,6 +165,14 @@ class SayCanConfig(CommonConfig):
     # Cached plans from earlier instructions, shown as worked examples.
     plan_library_top_k = 3
 
+    # Attempts (1 initial + retries) to get a usable JSON score reply per step, before giving
+    # up with "scoring_failed". Some models/deployments are measurably less reliable here than
+    # others (e.g. a self-hosted Qwen deployment was measured at ~50% per-call failure on a
+    # dynamic JSON key containing an embedded quote, such as shift_focus("RIGHT") — both in
+    # schema-guided and loose JSON mode); raise this per-config for such a provider rather than
+    # changing the shared action-string representation.
+    score_reply_attempts = 2
+
 
 class DreamCoderConfig(CommonConfig):
     '''B3-a: DreamCoder-style program search over SPL's DSL. No LLM except the shared
@@ -232,13 +250,25 @@ class DreamCoderConfig(CommonConfig):
 
     # Wake/sleep rounds. Each one searches the still-unsolved tasks, compresses the
     # solutions into abstractions, and re-weights the grammar on what was used.
-    search_iterations = 3
+    #
+    # 6, not 3: at 99 concepts the library has far more room to grow across rounds than the
+    # 5-16 concept smoke/probe runs this file used to size for, and each round is what lets
+    # a freshly-learned abstraction feed back into the NEXT round's enumeration and
+    # recognition training. Sized jointly with enumeration_timeout below for a ~22-23h total
+    # (recognition_timeout=1800s below is unchanged) -- see enumeration_timeout's comment.
+    search_iterations = 6
 
     # Seconds of enumeration per iteration, across all unsolved tasks.
     # Cost grows as ~e^(0.79 x MDL), so this buys description length logarithmically:
     # the shallow concepts land around MDL 12-15 and the composites at 35+, which no
     # feasible budget reaches. Raising this does not change which band is reachable.
-    enumeration_timeout = 300.0
+    #
+    # 10800 (3h), not 300 (5min): 300s was sized for a smoke/probe run, not a real budget.
+    # 6 iterations x (10800s enumeration + up to 1800s recognition) = ~21h core loop, leaving
+    # ~1-2h for demo loading/sketching and streamed scoring across 99 concepts -- targets a
+    # single ~24h job slot. Re-check against the actual per-iteration timing this run logs in
+    # its first two iterations and adjust search_iterations if it is tracking short or long.
+    enumeration_timeout = 10800.0
     max_mdl = 100.0
 
     # Feed STITCH abstractions back into the grammar. False is the "no library growth"
@@ -422,5 +452,15 @@ class LiloConfig(DreamCoderConfig):
     # LILO itself sets enumeration_timeout=10 — the LLM is the primary solver there. Search
     # is free where API calls are not, so this runs the enumerator far longer than LILO does
     # while keeping LLM usage exactly at LILO's level. Set to 0 for the LLM-only ablation.
-    enumeration_timeout = 600.0
-    search_iterations = 3
+    #
+    # 21600 (6h) = 2x DreamCoderConfig.enumeration_timeout above, keeping the ratio you chose
+    # at smoke scale. search_iterations stays matched at 6 for comparable wake/sleep depth.
+    # Flagged, not silently absorbed: 6 x (21600s + up to 1800s recognition) = ~39h core loop
+    # BEFORE the LLM proposer's own latency (measured 400-560s per iteration on the 5-concept
+    # smoke test; unpredictable and likely larger across 99 concepts' worth of still-unsolved
+    # tasks). This will not fit one 24h job slot. Plan on it spanning 2+ segments via
+    # load_concept_checkpoint (see lilo_resume.md) -- true iteration-exact resume isn't built
+    # yet, so a segment boundary loses only the search work of whichever concept was mid-wake
+    # when it was cut, same as DreamCoder above.
+    enumeration_timeout = 21600.0
+    search_iterations = 6

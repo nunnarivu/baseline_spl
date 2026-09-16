@@ -1,8 +1,10 @@
 '''
 llm_backend.py
 
-A drop-in replacement for Demo2Code's ``call_openai_api`` that routes through SPL's
-own ``openaiClient``.
+A drop-in replacement for Demo2Code's ``call_openai_api`` that routes through one of SPL's
+``SPL.model.llm.<provider>Client`` classes (provider chosen by ``configs.llm_provider``,
+independent of what SPL's own Generalize stage is currently using — see
+``SPL.model.llm.factory.build_llm_client``).
 
 Upstream (``third_party/demo2code/scripts/overall_helpers/openai_helper.py``) hard-codes
 ``gpt-3.5-turbo`` / ``gpt-3.5-turbo-16k`` and talks to the SDK directly. We keep its
@@ -105,18 +107,17 @@ class LLMBackend:
     '''
 
     def __init__(self, configs):
-        from SPL.model.llm.openai import openaiClient
+        from SPL.model.llm.factory import build_llm_client
 
         self.configs = configs
-        # Parity is with SPL's *Generalize* stage: that is the model SPL uses to write
-        # the concept class, so it is the model a baseline must be compared against.
-        # (SketchConfig.llm_model is a different, cheaper model used only for parsing.)
-        self.model = configs.generalize_config.llm_model
-        self.vlm_model = getattr(configs, "vlm_model", "gpt-5")
-        self.client = openaiClient(configs.generalize_config.llm_api_key,
-                                   organization=getattr(configs.generalize_config, "organization", None),
-                                   service_tier=getattr(configs, "service_tier", None))
-        self.client.set_model(self.model)
+        # Provider and model are baseline_spl's own, independent of what SPL's Generalize
+        # stage is currently using (so the two can run different providers in parallel);
+        # credentials (api key, base_url, vertex project/creds, ...) are still SPL's own,
+        # via configs.generalize_config, rather than a second copy of them.
+        self.model = configs.codegen_model or configs.generalize_config.llm_model
+        self.vlm_model = getattr(configs, "vlm_model", None) or self.model
+        provider = getattr(configs, "llm_provider", "openai")
+        self.client = build_llm_client(provider, self.model, configs.generalize_config)
 
         self.cache_path = Path(configs.llm_cache_dir) / "llm_cache.json"
         self._cache: Dict[str, Any] = self._load_cache()
@@ -263,7 +264,8 @@ class LLMBackend:
         if "max_tokens" in lowered and "max_completion_tokens" in lowered and "max_tokens" in params:
             params["max_completion_tokens"] = params.pop("max_tokens")
             return "max_tokens -> max_completion_tokens"
-        for name in ("temperature", "stop", "max_tokens", "max_completion_tokens", "top_p", "n"):
+        for name in ("temperature", "stop", "max_tokens", "max_completion_tokens", "top_p", "n",
+                    "response_format"):
             if name in lowered and name in params:
                 params.pop(name)
                 return name

@@ -67,7 +67,7 @@ def assert_not_spl_library(path) -> None:
 # Kept here rather than in the config files: *which* fields must match is machinery, and
 # duplicating the list per config would let it drift between experiments.
 PARITY_CRITICAL = ("concepts", "num_demos_per_concept", "codegen_model",
-                   "vlm_model", "max_code_retries", "use_evaluator_feedback")
+                   "vlm_model", "llm_provider", "max_code_retries", "use_evaluator_feedback")
 
 
 #: Parity-critical settings a baseline may opt OUT of by setting them to None, meaning "this
@@ -176,6 +176,14 @@ class BaselineConfig(SPLConfig):
         # the deep-copied Generalize config, and the sketch agent would fail later, far from here.
         if run_cfg.codegen_model is not None:
             configs.generalize_config.llm_model = run_cfg.codegen_model
+
+        import inspect
+        from SPL.utils.config_snapshot import save_config_snapshot
+        try:
+            save_config_snapshot(inspect.getfile(run_cfg), configs.run_dir,
+                                "baseline_config_used.py")
+        except OSError as exc:
+            warnings.warn(f"Could not save a config snapshot for this run: {exc}")
         return configs
 
     def __repr__(self):

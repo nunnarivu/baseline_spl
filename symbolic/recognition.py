@@ -35,6 +35,7 @@ in every published domain -- but it should be stated.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from baseline_spl.symbolic._dreamcoder import Frontier, FrontierEntry, Program, Task
@@ -412,7 +413,13 @@ def train_recognizer(grammar, tasks: Dict[str, Task], solutions, *,
             log(f"  training recognizer on {len(replays)} replay frontier(s) "
                 f"+ fantasies (helmholtzRatio={ratio})")
         # `steps` is the binding budget, as upstream intends; `epochs=None` lets it run.
-        request = next(iter(tasks.values())).request if tasks else CONCEPT_REQUEST
+        # Fantasies are sampled at one request type. With mixed arities present, take the most
+        # common one rather than whichever task happens to be first in the dict.
+        requests = Counter(str(t.request) for t in tasks.values()) if tasks else Counter()
+        request = CONCEPT_REQUEST
+        if requests:
+            modal = requests.most_common(1)[0][0]
+            request = next(t.request for t in tasks.values() if str(t.request) == modal)
         recognizer.train(replays, epochs=epochs, steps=steps, helmholtzRatio=ratio,
                          CPUs=cpus, timeout=timeout, defaultRequest=request,
                          biasOptimal=bias_optimal, auxLoss=auxiliary_loss)

@@ -111,6 +111,42 @@ def test_frontier_holds_several_verified_programs():
     assert kept > 1, f"no task kept more than one program (best was {kept})"
 
 
+def test_every_arity_is_read_back_at_its_own_arity():
+    '''A found program is read back as a Term at the arity of ITS task, not the run's.
+
+    The readback used one run-wide flag -- `not tasks[0].closed`, i.e. "arity 1 unless the run
+    is demo-level". Correct only while every concept took exactly one integer. With SPL's 99
+    concepts (69 take one, 12 take two, 2 take three, 15 take none) a mixed run peeled the
+    wrong number of lambdas off every task that was not arity 1, and `_to_state` then met a
+    bare Abstraction: "unexpected head (lambda ...)". The solution was discarded, so the
+    concept produced no class and no program_accuracy -- silently, because a solved-but-
+    untranslatable task just looks unsolved in the metrics.
+
+    Targets are a single placement so `place` solves every task within a second; what is under
+    test is the readback, not the search.
+    '''
+    from baseline_spl.symbolic import ir, oracles
+    from baseline_spl.symbolic.bridge import grammar
+    from baseline_spl.symbolic.search import SearchTask, wake
+
+    target = ir.positions(oracles.ORACLES["row"], 1)      # one cell
+    tasks = [
+        SearchTask(name="closed0", examples=[((), target)], closed=True),
+        SearchTask(name="one1", examples=[(3, target), (5, target)]),
+        SearchTask(name="two2", examples=[((3, 2), target), ((5, 4), target)]),
+        SearchTask(name="three3", examples=[((3, 2, 1), target), ((5, 4, 2), target)]),
+    ]
+    assert [t.arity for t in tasks] == [0, 1, 2, 3], "the fixture must span every arity"
+
+    stats = wake(grammar("standard"), tasks, timeout=20.0, max_mdl=8.0)
+    for task in tasks:
+        solution = stats.per_task[task.name]
+        assert solution.program is not None, f"{task.name}: nothing found to read back"
+        assert solution.term is not None, (
+            f"{task.name} (arity {task.arity}): found {solution.program} but could not read "
+            f"it back as a term")
+
+
 def test_per_task_grammars_are_grouped():
     '''With a {task: grammar} map the wake splits into one unit per distinct grammar --
     the structure the recognition model needs.'''
@@ -131,6 +167,7 @@ def main() -> int:
         ("slices abut", test_slices_abut_exactly),
         ("lowerBound does not prune (so sub-bands cannot win)", test_lower_bound_does_not_prune),
         ("per-task grammars group into one unit each", test_per_task_grammars_are_grouped),
+        ("every arity is read back at its own arity", test_every_arity_is_read_back_at_its_own_arity),
         ("frontiers hold several verified programs", test_frontier_holds_several_verified_programs),
     ]
     for label, check in checks:

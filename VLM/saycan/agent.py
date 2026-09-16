@@ -41,6 +41,28 @@ from baseline_spl.common.serialize_text import to_demo2code_text
 from baseline_spl.common.serialize_visual import demo_frames
 
 DONE = "done()"
+
+# Declarative response shapes for the two JSON replies this agent asks for, instead of a bare
+# "json" hint. Every provider's client interprets this same {"type": "json_schema", ...} shape
+# through its own native structured-output mechanism (OpenAI's json_schema mode, Vertex's
+# response_schema, vLLM's guided decoding where enabled) — the request layer degrades to plain
+# JSON, or plain text, if a given provider/deployment can't honor it; _parse_scores/_parse_plan
+# already tolerate prose or fences around the JSON, so nothing here is provider-specific.
+# strict=False: OpenAI's strict json_schema mode rejects an object schema with no fixed
+# `properties` ("object schema missing properties") -- action names are dynamic, so there's
+# no fixed set to enumerate. Non-strict mode accepts the open-ended additionalProperties map;
+# Gemini/vLLM ignore the (OpenAI-specific) `strict` field entirely.
+SCORE_RESPONSE_SCHEMA = {"type": "json_schema", "name": "action_scores", "strict": False,
+                         "schema": {"type": "object", "additionalProperties": {"type": "number"}}}
+# additionalProperties=False: OpenAI's strict json_schema mode (the default here, since this
+# schema has a fixed set of properties to enumerate) requires every object level to explicitly
+# forbid extra properties -- "'additionalProperties' is required to be supplied and to be
+# false" otherwise. Gemini/vLLM ignore the (OpenAI-specific) field entirely.
+PLAN_RESPONSE_SCHEMA = {"type": "json_schema", "name": "action_plan",
+                        "schema": {"type": "object",
+                                   "properties": {"plan": {"type": "array", "items": {"type": "string"}}},
+                                   "required": ["plan"], "additionalProperties": False}}
+
 ASSIGN_TEMPLATE = "assign_focus(object_id=<id of a block already placed>)"
 _ASSIGN_RE = re.compile(r"^\s*assign_focus\(\s*object_id\s*=\s*(\d+)\s*\)\s*$")
 # Multi-step shift, offered as a template like assign_focus: SPL picks num_steps against the
@@ -337,7 +359,7 @@ class SayCanAgent:
             f"# Current state\n{self._state_text(state, [], names)}\n\n"
             "# Available actions\n"
             + "\n".join(f"- {c}" for c in fixed + templates),
-            response_format="json", max_tokens=4000)
+            response_format=PLAN_RESPONSE_SCHEMA, max_tokens=4000)
 
         plan = self._parse_plan(reply, fixed, max_shift)[: self.configs.max_steps]
         if not plan:
@@ -416,16 +438,18 @@ class SayCanAgent:
                 turn = f"{opening}\n{turn}"
 
             scores = {}
-            for _attempt in range(2):       # one retry, then give up rather than guess
-                reply = conversation.ask(turn, response_format="json", max_tokens=2000)
+            attempts = int(getattr(self.configs, "score_reply_attempts", 2))
+            for attempt in range(attempts):
+                reply = conversation.ask(turn, response_format=SCORE_RESPONSE_SCHEMA, max_tokens=2000)
                 scores = self._parse_scores(reply, fixed, placed, max_shift)
                 if scores:
                     break
-                log(f"[saycan] step {step}: unusable score reply; re-asking")
+                log(f"[saycan] step {step}: unusable score reply "
+                    f"(attempt {attempt + 1}/{attempts}); re-asking")
                 turn = ("Your reply was not a usable JSON object. Reply with ONLY a JSON "
                         "object mapping each listed action to a number from 0 to 100.")
             if not scores:
-                log(f"[saycan] step {step}: no valid scores after a retry; stopping")
+                log(f"[saycan] step {step}: no valid scores after {attempts} attempt(s); stopping")
                 return actions, "scoring_failed"
 
             best = max(scores, key=scores.get)

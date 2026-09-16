@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import stitch_core
 
 from baseline_spl.symbolic._dreamcoder import Grammar, Invented, Program
-from baseline_spl.symbolic.bridge import CONCEPT_REQUEST, primitives_for
+from baseline_spl.symbolic.bridge import CONCEPT_REQUEST
 
 
 @dataclass
@@ -252,7 +252,7 @@ def extend(grammar: Grammar, abstractions: Sequence[Invented], level: str = "sta
     if not fresh:
         return grammar
     if uniform:
-        return Grammar.uniform(primitives_for(level) + list(_invented(grammar)) + fresh,
+        return Grammar.uniform(_base_primitives(grammar) + list(_invented(grammar)) + fresh,
                                continuationType=grammar.continuationType)
     return Grammar(grammar.logVariable,
                    list(grammar.productions) + [(0.0, a.infer(), a) for a in fresh],
@@ -261,6 +261,22 @@ def extend(grammar: Grammar, abstractions: Sequence[Invented], level: str = "sta
 
 def _invented(grammar: Grammar) -> List[Invented]:
     return [p for _l, _t, p in grammar.productions if isinstance(p, Invented)]
+
+
+def _base_primitives(grammar: Grammar) -> List:
+    '''Every non-invented production `grammar` already carries -- whatever literals it was
+    actually built with, not `level`'s default {1, 2}.
+
+    `extend` used to rebuild from `primitives_for(level)`, which is right for a FRESH grammar
+    but wrong for one that also went through `_literal_ceiling` (every demo-level run: closed
+    programs bake the size in as a literal, so the grammar is widened to 3..N for N derived
+    from the task parameters). Rebuilding from the level alone silently dropped 3..N the
+    moment the first abstraction was extracted -- measured: a demo-level run solved `row` at
+    literal 5, then `best_compression`'s very next `corpus_mdl` call scored that same program
+    under a grammar missing "5" and returned nonsense (DreamCoder's own `likelihoodSummary`
+    treats an out-of-grammar head as unreachable code, not an error to raise).
+    '''
+    return [p for _l, _t, p in grammar.productions if not isinstance(p, Invented)]
 
 
 def reweight(grammar: Grammar, solved: Sequence[Tuple[str, Program]],

@@ -450,24 +450,20 @@ def wake(grammar, tasks: Sequence[SearchTask], *, timeout: float = 60.0,
             pool.join()
 
     stats.seconds = time.time() - started
+    arity_of_task = {t.name: t.arity for t in tasks}
     for solution in stats.per_task.values():
         if solution.term is None and solution.program is not None:
             try:
                 solution.term = to_term(solution.program,
-                                        concept_level=not _closed_run(tasks))
+                                        concept_level=arity_of_task.get(solution.task, 0))
             except Exception as exc:  # noqa: BLE001
                 # The harness reports this as `search_untranslatable`, but only the reason
                 # explains why a solved concept produced no class.
                 if log:
-                    log(f"  {solution.task}: solved, but the program could not be read back "
-                        f"as a term ({type(exc).__name__}: {exc})")
+                    log(f"  {solution.task}: {solution.status}, but the program could not be "
+                        f"read back as a term ({type(exc).__name__}: {exc})")
                 solution.term = None
     return stats
-
-
-def _closed_run(tasks) -> bool:
-    '''Whether this run's tasks are closed programs (demo-level).'''
-    return bool(tasks) and bool(getattr(list(tasks)[0], "closed", False))
 
 
 def _parse(source: str, log=None) -> Optional[Program]:

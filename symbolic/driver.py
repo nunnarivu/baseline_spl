@@ -460,13 +460,13 @@ def _accept_proposals(result: RunResult, candidates: Dict[str, Sequence[Program]
             # (`search.py:345`): otherwise an approximate LLM proposal would be recorded as
             # untranslatable where an approximate enumerated one is lowered and scored, which
             # would under-report this baseline for no reason but an inconsistency here.
-            # A demo-level task's program is closed (`tstate -> tstate`); hardcoding the
-            # concept-level shape here meant EVERY LLM proposal on a demo-level run failed
-            # translation and was recorded untranslatable. `search.py` gets this right from
-            # `task.closed`; do the same rather than trust the default.
-            closed = bool(getattr(targets.get(name), "closed", False))
+            # A task's program has as many leading lambdas as its arity; hardcoding the
+            # 1-argument shape here meant every LLM proposal on a closed or multi-argument
+            # task failed translation and was recorded untranslatable. `search.py` gets this
+            # right from `task.arity`; do the same rather than trust the default.
+            arity = getattr(targets.get(name), "arity", 0)
             try:
-                solution.term = to_term(solution.program, concept_level=not closed)
+                solution.term = to_term(solution.program, concept_level=arity)
             except Exception as exc:  # noqa: BLE001
                 log(f"  proposal for {name} could not be read back as a term ({exc})")
     return solved
