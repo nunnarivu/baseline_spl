@@ -15,12 +15,8 @@ Run from the directory holding both SPL and baseline_spl.
 from __future__ import annotations
 
 from SPL.config.spl_config import ALL_CONCEPTS  # noqa: F401  — for setting `concepts`
+from SPL.config.spl_config import GeneralizeConfig
 
-
-# All methods must generate code with the same model, or the results compare models
-# instead of methods. SPL's configured 'gpt-5.1-codex-max' is deprecated and 404s (so is
-# 'gpt-5.2-codex') — set SPL's GeneralizeConfig to CODEGEN_MODEL when you sync it.
-# 'gpt-5.3-codex' also works but is Responses-endpoint only; the backend handles that.
 CODEGEN_MODEL = "gpt-5.1"
 VLM_MODEL = "gpt-5.1"
 
@@ -32,17 +28,24 @@ class CommonConfig:
     learn = True
     inference = True
 
-    # Load concepts learned earlier: resumes an interrupted run, adds concepts to an
-    # existing one, and lets inference run separately from learning. Already-learned
-    # concepts are skipped and metric files are appended to, not overwritten.
-    resume = True
-    # Library to resume from. None = this run's own concept_library.pt.
-    resume_from = None
+    # Concept library to load, named exactly as SPLConfig names it. None loads nothing and
+    # the run starts from an empty library — so to resume an interrupted run, to add concepts
+    # to an existing one, or to run inference separately from learning, put that run's library
+    # here: runs/<run_name>/concept_library.pt. Concepts it holds are not learned again and
+    # the metric files are appended to; with None they are rewritten, and the harness warns
+    # before it does. It may not point inside SPL's tree — see assert_not_spl_library.
+    load_concept_checkpoint = None
+    # Concepts to leave out when that library is loaded, so they are learned again.
+    skip_loading_concepts = ()
+    # True skips learning a concept the loaded library already holds. False relearns it, and
+    # register_inductive_concepts then raises on the duplicate name (as in SPL), so pair it
+    # with skip_loading_concepts for the concepts you actually want redone.
+    ignore_learnt_concepts = True
 
     # Data. Use ALL_CONCEPTS for the full sweep. row/tower are smoke-test concepts —
     # an LLM already knows them, so they test plumbing, not capability; pins, psi,
     # arch_bridge and x are the ones that discriminate.
-    concepts = ["row", "tower", "staircase", "pyramid", "arch_bridge"]
+    concepts = list(ALL_CONCEPTS)
     num_demos_per_concept = 2
     num_workers = 4
 
@@ -55,9 +58,16 @@ class CommonConfig:
     #   'default' : standard processing
     service_tier = "flex"
 
-    # Retries on invalid/unparseable code only. Baselines deliberately get no
-    # execution-grounded verification — that loop is an SPL contribution.
+    # Retries per concept class, shared by parse failures and (below) evaluation failures.
     max_code_retries = 3
+
+    # Run each generated class on the demonstrations and retry with a report (crash, block
+    # count, per-block distance to the demo's final state, bookkeeping), as SPL's Generalize
+    # evaluator does. Passes when every block is within sketch_val_state_error_threshold.
+    # Not given: SPL's reward and its MCTS-plan reference. Image-only variants get the report
+    # without distances. Needs sketch_mode='corrected' and use_demo=True; SayCan ignores it.
+    # False: parse retries only, the loop stays an SPL contribution.
+    use_evaluator_feedback = False
 
     # What signature information reaches program generation.
     #   'corrected' : the sketch, after SPL's validate_and_correct_sketch
@@ -118,7 +128,8 @@ class SayCanConfig(CommonConfig):
     '''SayCan (Ahn et al., 2022): one primitive at a time, no program. The control for
     whether a program is needed at all.
 
-    sketch_mode is ignored — SayCan emits actions, so there is no signature to give it.
+    sketch_mode and use_evaluator_feedback are ignored — SayCan emits actions, so there is
+    no signature to give it and no class to evaluate.
     '''
 
     # How the demonstrations are shown: the serialized [Scenario i] block, or the images.
@@ -153,6 +164,16 @@ class DreamCoderConfig(CommonConfig):
     comes from search, never from a model.
     '''
 
+    # None means "calls no model", which is the literal truth for B3-a: enumeration writes the
+    # program, and the only LLM anywhere near this run is the SHARED sketch agent, which uses
+    # SPL's own SketchConfig.llm_model rather than either of these.
+    #
+    # Inheriting CommonConfig's model instead made this baseline declare one it never calls, so
+    # `from_run_config` compared it against SPL's and stopped every run at "Type yes to continue
+    # with these models" -- including background runs and pytest, which have no stdin.
+    codegen_model = None
+    vlm_model = None
+
     # Which primitives the search may use. Bigger is more expressive and exponentially
     # harder to search, which is the ablation this exposes.
     #   'minimal'  : shift/place/loop only — the 10 concepts needing no focus save/restore
@@ -173,6 +194,36 @@ class DreamCoderConfig(CommonConfig):
     # SearchHarness._load_demos). Lower it if the machine is tight, raise it to reload less
     # often on a machine with room.
     scoring_chunk = 8
+
+    # --- generalising demo-level solutions to unseen sizes ------------------------------ #
+    # A demo-level run solves each demonstration separately, so its programs are closed and
+    # the size is a literal. Anti-unifying a concept's solved demos recovers the parameterised
+    # class (`symbolic/generalise.py`), which is more than published DreamCoder does -- so it
+    # is reported as a separate, disclosed variant, never as the headline B3-a number.
+    recover_concept_classes = True
+
+    # DreamCoder's OWN route to an unseen size: enumerate the held-out task again under the
+    # learnt library (`dreamcoder.py:567`). The two arms answer "which generalises better".
+    heldout_enumeration = True
+
+    # Sizes to test generalisation on, with ground truth from `oracles.trace`. Keep inside the
+    # literal ceiling (`_literal_ceiling`, currently 13) or the SEARCH arm cannot express the
+    # target at all and the comparison measures the grammar rather than the mechanism.
+    heldout_sizes = (8, 10, 12)
+
+    # ONE budget for the whole held-out phase, not per task -- upstream passes a single
+    # `enumerationTimeout` for the entire test set. With a global grammar every held-out task
+    # shares one enumeration, so each candidate program is tested against all of them at once.
+    heldout_timeout = 300.0
+
+    # Fallback for a concept with one demo, or several demos that share a size. Temporary:
+    # every concept is expected to carry 2-3 DISTINCT sizes once the dataset is updated, and
+    # recoveries made this way are tagged so they cannot be mistaken for the real thing.
+    recover_allow_single_demo = True
+
+    # At k>=3 demos, rebuild the class from k-1 and require it to reproduce the excluded one.
+    # A class that only fits the demos it was built from has not generalised.
+    recover_holdout_validate = True
 
     # continuationType, as tower, LOGO, regex and LILO's own `structures` domain all set it
     # (`LAPSGrammar.uniform(primitives, continuationType=ttower)`). Makes state threading
@@ -235,6 +286,21 @@ class DreamCoderConfig(CommonConfig):
     recognition_steps = 10000
     recognition_epochs = None      # None = unbounded; `recognition_steps` is the budget
     recognition_timeout = 1800.0   # seconds, a safety cap on top of the step budget
+
+    # The recognition model's architecture, matching LILO's own loader
+    # (src/models/laps_dreamcoder_recognition.py) rather than upstream's library defaults,
+    # which are weaker (contextual=False, biasOptimal=None, auxLoss=False). These lived only
+    # as inline fallbacks in the harness, which meant the production value for every run was
+    # written in a file nobody would think to look in.
+    #   contextual : predict a bigram transition matrix over productions rather than
+    #                marginal unigram weights, so a per-task grammar can say "inside a loop
+    #                body, prefer place"
+    #   hidden     : must equal the feature extractor's output width -- frontierKL computes
+    #                _MLP(features).expand(1, features.size(-1)) and assumes it is preserved
+    recognition_hidden = 64
+    recognition_contextual = True
+    recognition_bias_optimal = True
+    recognition_auxiliary_loss = True
     # Fraction of training data drawn from the generative model rather than solved tasks.
     helmholtz_ratio = 0.5
 
@@ -256,26 +322,17 @@ class DreamCoderConfig(CommonConfig):
     #                  quantity CaP/Demo2Code get at coordinate_mode='raw'
     observation_mode = "continuous"
 
-    #   'exact'          : integer cells must match      (requires observation_mode='lattice')
-    #   'tolerance'      : every placement within accept_epsilon metres; deterministic, no
-    #                      SRN in the loop, but charges a placement after ten compounding
-    #                      shifts as strictly as the first
-    #   'srn_likelihood' : SPL's own probabilistic focus -- executor._predict_focus's Kalman
-    #                      step and executor._penalised_score. Identical machinery to SPL's
-    #                      MCTS reward rather than an analogy to it.
+    #   'exact'       : integer cells must match      (requires observation_mode='lattice')
+    #   'distance'    : every placement within accept_epsilon metres -- the SAME bar the LLM
+    #                   baselines apply (common/evaluator.py checks every block against
+    #                   sketch_val_state_error_threshold), so the numbers share one table
+    #   'mahalanobis' : every placement within accept_tau sigma of SPL's predicted focus.
+    #                   Same machinery as SPL's own focus belief, but still a 0/1 check --
+    #                   never SPL's graded reward, which is SPL's contribution to claim.
     # Only three of the six pairs are meaningful; the rest are rejected at startup.
-    evaluator = "srn_likelihood"
+    evaluator = "mahalanobis"
 
-    # evaluator='srn_likelihood' only.
-    #   'mahalanobis'      : accept iff every placement is within accept_tau sigma. Unit-free,
-    #                        no per-demo calibration, degrades naturally as variance compounds.
-    #   'penalised_loglik' : SPL's _penalised_score verbatim, as a mean shortfall in nats
-    #                        below the best score achievable at that covariance.
-    # The two are calibrated to each other: a Gaussian's log-density falls by d**2/2 at
-    # Mahalanobis distance d, so accept_margin=4.5 IS accept_tau=3.0. Switching between them
-    # therefore compares aggregation (worst placement vs mean, and whether the variance
-    # penalty participates), not scale.
-    accept_criterion = "mahalanobis"
+    # evaluator='mahalanobis' only.
     # 2.0, not the 3.0 the synthetic pre-flight chose. Measured on the real 8-concept sweep:
     # correct programs topped out at 0.62 sigma while the nearest WRONG program (staircase's
     # best near-miss) sat at 3.11, so 3.0 was running on a 0.11-sigma margin and 5.0 -- which
@@ -285,21 +342,22 @@ class DreamCoderConfig(CommonConfig):
     # trustworthy at its strict end, because real near-misses are the hard cases by
     # construction while invented ones are wrong in obvious ways.
     accept_tau = 2.0
-    # The Mahalanobis-equivalent margin, kept calibrated: a Gaussian's log-density falls by
-    # d**2/2 at distance d, so tau=2.0 is 2.0 nats.
-    accept_margin = 2.0
-    # SPL's own lambda in log p(x|focus) - lambda*tr(Sigma) (executor._penalised_score).
-    variance_penalty_weight = 1.2
 
-    # evaluator='tolerance' only. ~1 sigma of the SRN's along-axis horizontal prediction.
-    accept_epsilon = 0.03
+    # evaluator='distance' only. None means "use SPL's own sketch_val_state_error_threshold",
+    # which is what common/evaluator.py applies per block for the LLM baselines -- so the bar
+    # tracks SPL instead of being a second copy that can drift from it.
+    accept_epsilon = None
 
-    # `saved` lowers to assign_focus(object_id=...), which SPL resolves to the *observed*
-    # centroid of the placed block. Mirroring that is faithful, but it also lets a candidate
-    # re-synchronise to the demonstration at every `saved`, which makes acceptance easier for
-    # exactly the composite concepts the search struggles with. False restores the predicted
-    # mean instead; tests/test_gaussian.py measures the difference.
-    saved_resync = True
+    # `saved` lowers to assign_focus(object_id=...). False restores the PREDICTED mean; True
+    # snaps to the demonstration's observed centroid, which lets a candidate re-synchronise to
+    # the demo at every `saved` and makes acceptance easier for exactly the composite concepts
+    # the search struggles with.
+    #
+    # False now mirrors SPL: `assign_focus_to_placed_position = True` sends the focus where the
+    # PLAN placed the block, not where the demo has it, precisely so a wrong plan cannot jump
+    # back onto the correct structure. True was faithful to the older SPL and is kept as a knob;
+    # tests/test_gaussian.py measures the difference.
+    saved_resync = False
 
     # Which demos a concept-level task learns from.
     #   'distinct_params' : prefer demos whose parameter differs, so the loop is forced

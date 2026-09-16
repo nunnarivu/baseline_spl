@@ -33,11 +33,28 @@ DIRECTION_NAMES: Tuple[str, ...] = ("left", "right", "front", "behind", "top")
 # Integer expressions: the concept parameter, loop indices, literals, arithmetic.
 # --------------------------------------------------------------------------------------- #
 
+def args(value) -> Tuple:
+    '''Normalise a concept's arguments to a tuple, whatever shape the caller had.
+
+    A concept takes 0, 1, 2 or 3 integers -- 69 of SPL's 99 take one, 12 take two, 2 take
+    three, 15 take none. One argument stays a bare `int` so the 69 common concepts, the
+    oracles and the existing tests read exactly as they did; anything else is a tuple in
+    sketch-argument order. This is the only place that distinction is resolved.
+
+    Names follow the same rule, so `args("length")` and `args(5)` are both 1-tuples.
+    '''
+    if value is None:
+        return ()
+    if isinstance(value, (tuple, list)):
+        return tuple(value)
+    return (value,)
+
+
 class IntExpr:
-    def eval(self, param: int, loops: Sequence[int]) -> int:
+    def eval(self, param, loops: Sequence[int]) -> int:
         raise NotImplementedError
 
-    def render(self, param_name: str, loop_names: Sequence[str]) -> str:
+    def render(self, param_name, loop_names: Sequence[str]) -> str:
         raise NotImplementedError
 
 
@@ -54,13 +71,20 @@ class Const(IntExpr):
 
 @dataclass(frozen=True)
 class Param(IntExpr):
-    '''The concept's numeric argument -- `length`, `height`, `steps`.'''
+    '''One of the concept's numeric arguments -- `length`, `height`, `steps`.
+
+    `index` selects which, in sketch-argument order, the same order SPL's
+    `check_program_equivalence` pairs integers by. It defaults to 0, so every `Param()` written
+    before concepts had more than one argument still means what it did.
+    '''
+
+    index: int = 0
 
     def eval(self, param, loops):
-        return param
+        return args(param)[self.index]
 
     def render(self, param_name, loop_names):
-        return param_name
+        return str(args(param_name)[self.index])
 
 
 @dataclass(frozen=True)
@@ -103,7 +127,7 @@ class BinOp(IntExpr):
 # --------------------------------------------------------------------------------------- #
 
 class Term:
-    def evaluate(self, state: LatticeState, param: int, loops: Tuple[int, ...] = ()) -> LatticeState:
+    def evaluate(self, state: LatticeState, param, loops: Tuple[int, ...] = ()) -> LatticeState:
         raise NotImplementedError
 
 
@@ -135,12 +159,8 @@ class Move(Term):
     distance: "IntExpr"
 
     def evaluate(self, state, param, loops=()):
-        n = int(self.distance.value(param, loops))
-        if n < 0:
-            return state
-        for _ in range(n):
-            state = state.shifted(self.direction)
-        return state
+        n = int(self.distance.eval(param, loops))
+        return state.moved(self.direction, n) if n > 0 else state
 
 
 @dataclass(frozen=True)
@@ -199,11 +219,11 @@ class Saved(Term):
 
 # --------------------------------------------------------------------------------------- #
 
-def evaluate(term: Term, param: int, state: LatticeState = None) -> LatticeState:
+def evaluate(term: Term, param, state: LatticeState = None) -> LatticeState:
     return term.evaluate(EMPTY if state is None else state, param)
 
 
-def positions(term: Term, param: int) -> List[Tuple[int, int, int]]:
+def positions(term: Term, param) -> List[Tuple[int, int, int]]:
     '''The placement cells a term produces -- the quantity every SPL metric compares.'''
     return evaluate(term, param).positions
 

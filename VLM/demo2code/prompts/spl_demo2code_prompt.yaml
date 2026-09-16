@@ -126,9 +126,9 @@ stage2:
 
           assign_focus(position: list[float] = None, object_id: int = None)
               Move the focus to an absolute position, or onto an existing object.
-          shift_focus(direction: str)
-              Move the focus one block-step. direction is one of
-              "LEFT", "RIGHT", "FRONT", "BEHIND", "TOP".
+          shift_focus(direction: str, num_steps: int = 1)
+              Move the focus num_steps block-steps in one call (uncertainty is added once
+              per call). direction is one of "LEFT", "RIGHT", "FRONT", "BEHIND", "TOP".
           place_object_at_focus(object_id: int)
               Place the given object at the current focus. The focus does not move.
           filter(*attributes) -> list[int]
@@ -146,7 +146,7 @@ stage2:
           @property
           def plan(self)                       # execution trace, list of action strings
           @property
-          def blocks(self)                     # objects used
+          def blocks(self)                     # objects construct() placed, incl. by substructures
           @property
           def substructures(self)              # sub-concepts used
           @property
@@ -158,6 +158,8 @@ stage2:
       - The class name and __init__ arguments MUST match the initialized sketch exactly.
       - construct() must work for ANY value of the numeric argument. Use a loop over it;
         never hard-code a fixed number of placements.
+      - Do not special-case specific argument values (e.g. `if self.length == 5` or a dict
+        keyed on lengths): write the general rule that holds for every value.
       - Output ONLY the class definition inside a fenced code block with NO language tag,
         i.e. three backticks, newline, code, newline, three backticks.
       - No explanation, no example usage.

@@ -34,13 +34,19 @@ def _table():
     return srn.analytic_table(PITCH)
 
 
-def _task(name, term, params, *, noise=0.0, table=None, seed=0):
+def _task(name, term, params, *, noise=0.0, jitter=0.0, table=None, seed=0):
     '''A continuous task whose targets are what `term` itself predicts.
 
     Generating the targets from the oracle makes the test independent of the dataset while
-    still exercising the real scoring path. `noise` displaces every placement by a fixed
-    fraction of one sigma, which is what turns "does it accept the exact answer" into "does
-    it accept an answer that is right but observed imperfectly".
+    still exercising the real scoring path.
+
+    Two noise models, because the evaluators are stressed by different things:
+      `noise`  displaces each placement by a fraction of ITS OWN sigma, so the disturbance
+               grows as the model's uncertainty compounds. The right stress test for a
+               sigma-scaled threshold; it defeats a fixed radius by construction.
+      `jitter` displaces each placement by a fixed number of METRES, which is what real
+               error looks like -- 317 of 385 demos carry a fitted pose off by >2 cm, and
+               that error does not grow with the SRN's confidence.
     '''
     import random
 
@@ -52,9 +58,10 @@ def _task(name, term, params, *, noise=0.0, table=None, seed=0):
         state = gaussian.run(fn, n, table, (), False)
         target = []
         for mu, var in state.gaussians:
-            if noise:
-                target.append(tuple(mu[i] + noise * math.sqrt(var[i]) *
-                                    rng.choice((-1.0, 1.0)) for i in range(3)))
+            if noise or jitter:
+                target.append(tuple(
+                    mu[i] + (noise * math.sqrt(var[i]) + jitter) * rng.choice((-1.0, 1.0))
+                    for i in range(3)))
             else:
                 target.append(mu)
         examples.append((n, target))
@@ -82,6 +89,31 @@ def test_shift_accumulates_mean_and_variance_like_a_kalman_step():
     # Variance compounds -- the property the lattice representation discarded.
     assert twice.var == pytest.approx(tuple(start_var[i] + 2 * var_d[i] for i in range(3)))
     assert twice.var[1] > once.var[1] > start_var[1]
+
+
+def test_move_translates_n_steps_and_adds_variance_once_per_call():
+    '''SPL's shift_focus(d, num_steps=n): the mean moves n steps; Q is added once per call,
+    or n times under accumulate_shift_variance_per_step.'''
+    table = _table()
+    _mu_d, var_d = table["right"]
+    start = gaussian.initial(table)
+    chained = start
+    for _ in range(3):
+        chained = chained.shifted("right")
+
+    once = start.moved("right", 3)
+    assert once.mu == pytest.approx(chained.mu)
+    assert once.var == pytest.approx(tuple(start.var[i] + var_d[i] for i in range(3)))
+
+    per_step = gaussian.initial(table, per_step_variance=True).moved("right", 3)
+    assert per_step.mu == pytest.approx(chained.mu)
+    assert per_step.var == pytest.approx(chained.var)
+
+    # The IR node and the DreamCoder primitive must agree with `moved`.
+    term = ir.Seq(ir.Place(), ir.Move("right", ir.Param()), ir.Place())
+    fn = to_program(term).evaluate([])
+    assert gaussian.run(fn, 3, table).positions[1] == pytest.approx(once.mu)
+    assert ir.positions(term, 3)[1] == ir.evaluate(ir.Move("right", ir.Const(3)), 0).focus
 
 
 def test_compounding_variance_reaches_half_a_cell_within_one_row():
@@ -162,9 +194,14 @@ def test_gaussian_means_track_the_lattice_up_to_pitch():
 # 2. Oracles are accepted
 # --------------------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("criterion", ["mahalanobis", "penalised_loglik"])
-def test_every_oracle_is_accepted_when_observed_exactly(criterion):
-    ev = evaluate.LikelihoodEvaluator(criterion=criterion, resync=False)
+def _continuous_evaluators():
+    '''Both continuous evaluators, as `build` would make them.'''
+    return (evaluate.MahalanobisEvaluator(resync=False),
+            evaluate.DistanceEvaluator(resync=False))
+
+
+@pytest.mark.parametrize("ev", _continuous_evaluators(), ids=lambda e: e.name)
+def test_every_oracle_is_accepted_when_observed_exactly(ev):
     for name, term in oracles.ORACLES.items():
         task = _task(name, term, (3, 5))
         value = ev.score(to_program(term), task)
@@ -172,19 +209,58 @@ def test_every_oracle_is_accepted_when_observed_exactly(criterion):
         assert ev.accepts(value), f"{name}: {value}"
 
 
-@pytest.mark.parametrize("criterion", ["mahalanobis", "penalised_loglik"])
-def test_every_oracle_survives_realistic_observation_noise(criterion):
+def test_every_oracle_survives_realistic_observation_noise():
     '''One sigma of displacement on every placement must not reject the right program --
-    otherwise the threshold is measuring noise rather than correctness.'''
-    ev = evaluate.LikelihoodEvaluator(criterion=criterion, resync=False)
+    otherwise the threshold is measuring noise rather than correctness.
+
+    Mahalanobis only, and that asymmetry is the point: its threshold scales with the
+    covariance the SRN has accumulated, so a placement reached after ten compounding shifts is
+    judged against its own uncertainty. See the companion test for what a fixed radius does.
+    '''
+    ev = evaluate.MahalanobisEvaluator(resync=False)
     for name, term in oracles.ORACLES.items():
         task = _task(name, term, (3, 5), noise=1.0, seed=hash(name) % 1000)
         value = ev.score(to_program(term), task)
         assert ev.accepts(value), f"{name}: {value}"
 
 
-def test_tolerance_evaluator_accepts_oracles_and_rejects_a_shifted_program():
-    ev = evaluate.ToleranceEvaluator(epsilon=0.03, resync=False)
+def test_distance_evaluator_is_strict_under_compounding_noise(capsys):
+    '''Measured, not assumed: a FIXED radius rejects correct programs as error accumulates.
+
+    This is why `mahalanobis` is the default and `distance` is the parity knob. It is the same
+    effect already recorded for the LLM baselines -- a correct class drifts from 0 cm on the
+    first block to 8-11 cm on the last, so a per-block tolerance rejects it. Keeping the two
+    baselines on the SAME rule means they inherit the same limitation, which is the honest
+    outcome; hiding it by loosening the symbolic bar would not be.
+
+    Fails only if the fixed radius rejects EVERYTHING, which would make the knob useless.
+    '''
+    ev = evaluate.DistanceEvaluator(resync=False)
+    rows = []
+    for label, kwargs in (("exact", {}),
+                          ("2 cm fitted-pose jitter", {"jitter": 0.02}),
+                          ("1 sigma of the model's own variance", {"noise": 1.0})):
+        accepted = sum(
+            ev.accepts(ev.score(to_program(term),
+                                _task(n, term, (3, 5), seed=hash(n) % 1000, **kwargs)))
+            for n, term in oracles.ORACLES.items())
+        rows.append((label, accepted, len(oracles.ORACLES)))
+
+    with capsys.disabled():
+        print(f"\n  distance evaluator @ {ev.threshold:.3f} m, oracles accepted:")
+        for label, accepted, total in rows:
+            print(f"    {label:38} {accepted}/{total}")
+
+    exact_accepted = rows[0][1]
+    jitter_accepted = rows[1][1]
+    assert exact_accepted == len(oracles.ORACLES), "a fixed radius must accept exact observations"
+    assert jitter_accepted, (
+        "the fixed radius rejected every oracle at the 2 cm error real data carries, so the "
+        "distance knob is unusable on this dataset rather than merely strict")
+
+
+def test_distance_evaluator_accepts_oracles_and_rejects_a_shifted_program():
+    ev = evaluate.DistanceEvaluator(resync=False)
     term = oracles.ORACLES["row"]
     assert ev.accepts(ev.score(to_program(term), _task("row", term, (3, 5))))
 
@@ -193,11 +269,29 @@ def test_tolerance_evaluator_accepts_oracles_and_rejects_a_shifted_program():
     assert not ev.accepts(ev.score(to_program(wrong), _task("row", term, (3, 5))))
 
 
+def test_distance_threshold_matches_the_llm_baselines():
+    '''The symbolic bar must be SPL's own tolerance, the one common/evaluator.py applies.
+
+    If these drift apart the baselines are judged differently while their numbers sit in one
+    table, which is the asterisk this evaluator exists to avoid.
+    '''
+    from SPL.config.spl_config import SPLConfig
+
+    assert evaluate.DistanceEvaluator().threshold == pytest.approx(
+        SPLConfig.sketch_val_state_error_threshold)
+
+
+def test_distance_acceptance_is_inclusive():
+    '''"Within 0.06" includes exactly 0.06; the base class is a strict `<`.'''
+    ev = evaluate.DistanceEvaluator(epsilon=0.05, resync=False)
+    assert ev.accepts(0.05), "a placement exactly on the tolerance must be accepted"
+    assert not ev.accepts(0.0500001)
+
+
 def test_wrong_placement_count_is_never_accepted():
     '''The check exact match got for free. Without it a program placing three blocks scores
     well against a five-block demonstration by matching a prefix.'''
-    for ev in (evaluate.LikelihoodEvaluator(resync=False),
-               evaluate.ToleranceEvaluator(resync=False)):
+    for ev in _continuous_evaluators():
         term, short = oracles.ORACLES["row"], oracles.ORACLES["tower"]
         task = _task("row", term, (5,))
         # `staircase` places n(n+1)/2 blocks against row's n -- a guaranteed count mismatch.
@@ -224,14 +318,19 @@ def _confusable_pairs():
             ("staircase", "inverted_staircase")]
 
 
-@pytest.mark.parametrize("criterion", ["mahalanobis", "penalised_loglik"])
-def test_threshold_separates_oracles_from_confusable_programs(criterion):
+@pytest.mark.parametrize("ev", _continuous_evaluators(), ids=lambda e: e.name)
+def test_threshold_separates_oracles_from_confusable_programs(ev):
     '''The decisive test. Every oracle accepted, every same-length wrong program rejected,
-    at the shipped default threshold.'''
-    ev = evaluate.LikelihoodEvaluator(criterion=criterion, resync=False)
+    at the shipped default threshold.
+
+    Noise is applied only for the sigma-scaled evaluator. A fixed radius is measured against
+    compounding noise in its own test; asking it to pass here as well would simply re-measure
+    that, and would hide whether it SEPARATES -- which is the question this test asks.
+    '''
+    noise = 1.0 if ev.name == "mahalanobis" else 0.0
 
     for name, term in oracles.ORACLES.items():
-        task = _task(name, term, (3, 5), noise=1.0, seed=7)
+        task = _task(name, term, (3, 5), noise=noise, seed=7)
         assert ev.accepts(ev.score(to_program(term), task)), f"oracle {name} rejected"
 
     for target, wrong in _confusable_pairs():
@@ -247,7 +346,7 @@ def test_separation_sweep_reports_a_usable_window(capsys):
     rows = []
     usable = []
     for tau in (0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 25.0):
-        ev = evaluate.LikelihoodEvaluator(criterion="mahalanobis", tau=tau, resync=False)
+        ev = evaluate.MahalanobisEvaluator(tau=tau, resync=False)
         accepted_oracles = sum(
             ev.accepts(ev.score(to_program(term), _task(n, term, (3, 5), noise=1.0, seed=7)))
             for n, term in oracles.ORACLES.items())
@@ -297,7 +396,7 @@ def test_the_default_threshold_clears_the_real_near_miss_margin():
 # --------------------------------------------------------------------------------------- #
 
 def test_invalid_observation_and_evaluator_pairs_are_rejected_loudly():
-    for bad in [("lattice", "tolerance"), ("lattice", "srn_likelihood"),
+    for bad in [("lattice", "distance"), ("lattice", "mahalanobis"),
                 ("continuous", "exact")]:
         with pytest.raises(ValueError):
             evaluate.validate(*bad)
@@ -306,15 +405,21 @@ def test_invalid_observation_and_evaluator_pairs_are_rejected_loudly():
 
 
 def test_build_returns_the_configured_evaluator():
-    class Cfg:
+    class Maha:
         observation_mode = "continuous"
-        evaluator = "srn_likelihood"
-        accept_criterion = "penalised_loglik"
-        accept_margin = 4.5
+        evaluator = "mahalanobis"
+        accept_tau = 2.5
 
-    ev = evaluate.build(Cfg)
-    assert isinstance(ev, evaluate.LikelihoodEvaluator)
-    assert ev.criterion == "penalised_loglik" and ev.threshold == 4.5
+    ev = evaluate.build(Maha)
+    assert isinstance(ev, evaluate.MahalanobisEvaluator) and ev.threshold == 2.5
+
+    class Distance:
+        observation_mode = "continuous"
+        evaluator = "distance"
+        accept_epsilon = 0.04
+
+    ev = evaluate.build(Distance)
+    assert isinstance(ev, evaluate.DistanceEvaluator) and ev.threshold == pytest.approx(0.04)
 
     class Lattice:
         observation_mode = "lattice"
@@ -323,16 +428,14 @@ def test_build_returns_the_configured_evaluator():
     assert isinstance(evaluate.build(Lattice), evaluate.ExactEvaluator)
 
 
-def test_mahalanobis_and_loglik_thresholds_are_calibrated():
-    '''A Gaussian's log-density falls by d**2/2 at Mahalanobis distance d, so tau=3 and
-    margin=4.5 are the same threshold. If this drifts, the two knobs stop being comparable.'''
-    var = (0.001, 0.002, 0.0005)
-    offset = tuple(3.0 * math.sqrt(v) for v in var)   # exactly 3 sigma away, per axis...
-    # ...which is sqrt(3) * 3 sigma in 3-D, so scale back to a true 3-sigma displacement.
-    scale = 3.0 / gaussian.mahalanobis(offset, (0.0, 0.0, 0.0), var)
-    offset = tuple(o * scale for o in offset)
+def test_distance_falls_back_to_spls_threshold_when_unset():
+    '''`accept_epsilon = None` must mean SPL's own tolerance, not a hardcoded copy.'''
+    from SPL.config.spl_config import SPLConfig
 
-    assert gaussian.mahalanobis(offset, (0.0, 0.0, 0.0), var) == pytest.approx(3.0)
-    shortfall = (gaussian.penalised_ceiling(var)
-                 - gaussian.penalised_score(offset, (0.0, 0.0, 0.0), var))
-    assert shortfall == pytest.approx(4.5, abs=1e-6)
+    class Cfg:
+        observation_mode = "continuous"
+        evaluator = "distance"
+        accept_epsilon = None
+
+    assert evaluate.build(Cfg).threshold == pytest.approx(
+        SPLConfig.sketch_val_state_error_threshold)

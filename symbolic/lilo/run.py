@@ -60,7 +60,14 @@ def main() -> None:
     if LiloConfig.learn:
         harness.learn_all()
     if LiloConfig.inference:
-        harness.infer_all()
+        # Same routing as B3-a: a finished demo-level run has nothing registered, so
+        # "inference" means generalisation to unseen sizes rather than `infer_all`.
+        from baseline_spl.symbolic.dreamcoder.run import _is_finished_demo_run
+
+        if _is_finished_demo_run(harness):
+            harness.generalise_all()
+        else:
+            harness.infer_all()
 
 
 if __name__ == "__main__":

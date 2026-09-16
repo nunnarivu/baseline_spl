@@ -1,0 +1,149 @@
+{
+  "solved": [
+    "column",
+    "row",
+    "tower"
+  ],
+  "approximate": [
+    "staircase"
+  ],
+  "unsolved": [],
+  "solved_by_llm": [],
+  "solved_by_enumeration": [
+    "column",
+    "row",
+    "tower"
+  ],
+  "abstractions": [
+    "#(lambda (lambda (lambda (loop $1 (lambda (lambda (shift $4 (place $0)))) $0))))"
+  ],
+  "documentation": {},
+  "evaluator": {
+    "evaluator": "srn_likelihood",
+    "accept_criterion": "mahalanobis",
+    "accept_threshold": 2.0,
+    "variance_penalty_weight": 1.2,
+    "saved_resync": true
+  },
+  "total_seconds": 371.9,
+  "iterations": [
+    {
+      "iteration": 0,
+      "solved": [
+        "column",
+        "row",
+        "tower"
+      ],
+      "newly_solved": [
+        "row",
+        "tower",
+        "column"
+      ],
+      "abstractions": [
+        "#(lambda (lambda (lambda (loop $1 (lambda (lambda (shift $4 (place $0)))) $0))))"
+      ],
+      "programs_enumerated": 22632,
+      "seconds": 48.15,
+      "programs_per_second": 470.0,
+      "max_mdl_reached": 15.0,
+      "recognition_trained": false,
+      "solved_by_llm": [],
+      "seconds_by_stage": {
+        "proposal": 0.0,
+        "wake": 48.15,
+        "conditioning": 0.0,
+        "compress": 0.02,
+        "documentation": 0.0,
+        "reweight": 0.0,
+        "recognition": 0.01
+      }
+    },
+    {
+      "iteration": 1,
+      "solved": [
+        "column",
+        "row",
+        "tower"
+      ],
+      "newly_solved": [],
+      "abstractions": [],
+      "programs_enumerated": 45920,
+      "seconds": 45.04,
+      "programs_per_second": 1019.4,
+      "max_mdl_reached": 15.0,
+      "recognition_trained": true,
+      "solved_by_llm": [],
+      "seconds_by_stage": {
+        "proposal": 0.0,
+        "wake": 45.04,
+        "conditioning": 0.01,
+        "compress": 0.0,
+        "documentation": 0.0,
+        "reweight": 0.0,
+        "recognition": 278.66
+      }
+    }
+  ],
+  "per_task": {
+    "row": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.4,
+      "search_score": 0.3252,
+      "trace_distance": null,
+      "programs_tried": 6760,
+      "seconds": 19.09,
+      "program": "(lambda (lambda (loop $1 (lambda (lambda (shift RIGHT (place $0)))) $0)))"
+    },
+    "tower": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.4,
+      "search_score": 0.4638,
+      "trace_distance": null,
+      "programs_tried": 6760,
+      "seconds": 19.09,
+      "program": "(lambda (lambda (loop $1 (lambda (lambda (shift TOP (place $0)))) $0)))"
+    },
+    "column": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.4,
+      "search_score": 0.6188,
+      "trace_distance": null,
+      "programs_tried": 6760,
+      "seconds": 19.09,
+      "program": "(lambda (lambda (loop $1 (lambda (lambda (shift FRONT (place $0)))) $0)))"
+    },
+    "staircase": {
+      "status": "approximate",
+      "solved_by": null,
+      "mdl": 14.08,
+      "search_score": 4.7264,
+      "trace_distance": null,
+      "programs_tried": null,
+      "seconds": null,
+      "program": "(lambda (lambda (loop $1 (lambda (lambda (#(lambda (lambda (lambda (loop $1 (lambda (lambda (shift $4 (place $0)))) $0)))) TOP $1 $0))) (#(lambda (lambda (lambda (loop $1 (lambda (lambda (shift $4 (place $0)))) $0)))) RIGHT $1 $0))))"
+    }
+  },
+  "search_seconds": 371.9,
+  "demo_selection": {
+    "row": [
+      "0000",
+      "0032"
+    ],
+    "tower": [
+      "0004",
+      "0020"
+    ],
+    "column": [
+      "0002",
+      "0018"
+    ],
+    "staircase": [
+      "0005",
+      "0021"
+    ]
+  },
+  "task_granularity": "concept"
+}

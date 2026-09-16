@@ -9,10 +9,10 @@ many second chances each got. Validation reuses SPL's own
 ``GeneralizeAgent._validate_class_code`` (a staticmethod) so the required class shape can
 never drift between SPL and the baselines.
 
-Note what is deliberately absent: SPL's execution-grounded evaluator
-(``SPL._build_concept_class_evaluator``, which runs the candidate on the demonstration,
-scores its reward and re-prompts with a per-block divergence report). That loop is an SPL
-contribution; baselines retry on parse/structure failures only.
+By default baselines retry on parse/structure failures only: SPL's execution-grounded
+evaluator (``SPL._build_concept_class_evaluator``) is an SPL contribution. With
+``use_evaluator_feedback`` the loop also runs each class on the demonstrations
+(common/evaluator.py) and re-prompts with the report, within the same retry budget.
 '''
 
 from __future__ import annotations
@@ -22,6 +22,26 @@ from typing import Dict, List, Optional, Tuple
 
 from SPL.model.generalize import ConceptClassParseError, GeneralizeAgent
 from SPL.model.text_utils import extract_code_block
+
+# SPL's evaluation retry prompts (GeneralizeAgent._build_eval_retry_prompt and
+# _build_bookkeeping_prompt), reworded: a baseline never saw plans or execution traces.
+_OUTPUT_ONLY = ("Output ONLY the class source code inside a single fenced ```python ... ``` "
+                "block, with the same required methods. Do not include any explanation or "
+                "example usage.")
+EVAL_RETRY_PROMPT = (
+    "# Your previous class was run on the demonstrations and did not reproduce them\n"
+    "Evaluation report: {report}\n\n"
+    "Focus your fix on the blocks the report names. Fix the general rule that produces them "
+    "so it holds for every argument value; do not special-case specific argument values "
+    "(e.g. `if self.length == 5` or a dict keyed on lengths). " + _OUTPUT_ONLY)
+BOOKKEEPING_RETRY_PROMPT = (
+    "# Your previous class reproduces the demonstrations, but its bookkeeping is wrong\n"
+    "`blocks`, `key_blocks` or a substructure's `blocks` do not match the objects "
+    "construct() actually placed.\n"
+    "Evaluation report: {report}\n\n"
+    "Keep the construction logic. Track the objects construct() places (including those "
+    "placed by substructures) and build `blocks` and `key_blocks` from them, not from the "
+    "`objects` passed in. " + _OUTPUT_ONLY)
 
 # Annotations we can map to a real type. Anything else becomes `object`, which makes
 # check_program_equivalence report "undecided" rather than guess at an arity match.
@@ -101,9 +121,10 @@ def ensure_class_name(code: str, wanted: str) -> str:
 
 def generate_with_retries(backend, system_prompt: str, user_prompt: str, *,
                           wanted_name: Optional[str] = None, max_retries: int = 3,
-                          max_tokens: int = 6000, images=None,
+                          max_tokens: int = 6000, images=None, evaluator=None,
                           log=print) -> Optional[str]:
-    '''Ask for a concept class, retrying only on structural failure.
+    '''Ask for a concept class, retrying on structural failure and, with an ``evaluator``
+    (common/evaluator.py), on failing to reproduce the demonstrations.
 
     ``images`` (PNG bytes) routes the request to the vision model instead; they stay
     attached across retries, since a retry that dropped them would be answering a
@@ -112,7 +133,8 @@ def generate_with_retries(backend, system_prompt: str, user_prompt: str, *,
     ``wanted_name`` renames the class to the sketch's concept. Pass None when no sketch
     was given: the model's own class name is then the concept name.
 
-    Output: the validated class source, or None if every attempt failed to parse.
+    Output: the first class that validates (and passes the evaluator), else the evaluator's
+    best-scoring class, else None if every attempt failed to parse.
     '''
     # One conversation: the task, the demonstration and any images go out once, and a
     # retry sends only what was wrong. Resending everything would repeat a ~2,300-token
@@ -138,7 +160,6 @@ def generate_with_retries(backend, system_prompt: str, user_prompt: str, *,
                 validate(code)  # renaming must not have broken the required shape
             else:
                 class_signature(code)  # must expose a usable __init__ with `objects`
-            return code
         except (ConceptClassParseError, ValueError, SyntaxError) as exc:
             last_error = exc
             if attempt >= max_retries:
@@ -147,6 +168,23 @@ def generate_with_retries(backend, system_prompt: str, user_prompt: str, *,
             # Only the correction: the conversation still holds the task and the answer.
             prompt = (f"# Your previous answer was rejected\n"
                       f"{GeneralizeAgent._build_retry_prompt(exc)}")
+            continue
 
+        if evaluator is None:
+            return code
+        passed, _score, report = evaluator(code)
+        if passed:
+            return code
+        last_error = report
+        if attempt >= max_retries:
+            break
+        log(f"[codegen] attempt {attempt + 1}/{max_retries + 1} did not reproduce the demonstrations:\n{report}")
+        template = BOOKKEEPING_RETRY_PROMPT if report.startswith("BOOKKEEPING:") else EVAL_RETRY_PROMPT
+        prompt = template.format(report=report)
+
+    if evaluator is not None and evaluator.best_code is not None:
+        log(f"[codegen] no class passed the evaluator in {max_retries + 1} attempts; "
+            f"keeping the best-scoring one (score {evaluator.best_score:.6f}).")
+        return evaluator.best_code
     log(f"[codegen] giving up after {max_retries + 1} attempts. Last error: {last_error}")
     return None

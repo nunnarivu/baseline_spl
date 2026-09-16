@@ -174,8 +174,16 @@ def task_language(task, *, include_demonstration: bool = True) -> str:
     parts = [task.instruction or task.name]
     if not include_demonstration:
         return parts[0]
+    from baseline_spl.symbolic.ir import args as _args
+
     mode = getattr(task, "observation_mode", "lattice")
+    names = [str(n) for n in _args(task.param_name)]
     for param, positions in task.examples:
         rendered = " ".join(_render(p, mode) for p in positions)
-        parts.append(f"{task.param_name}={param} -> {rendered}")
+        # Every argument by name, so a 2-argument concept reads
+        # "length=5, breadth=3 -> ...". Showing only the first would leave the model to guess
+        # which size produced the structure.
+        values = _args(param)
+        shown = ", ".join(f"{n}={v}" for n, v in zip(names, values)) or "(no arguments)"
+        parts.append(f"{shown} -> {rendered}")
     return " | ".join(parts)

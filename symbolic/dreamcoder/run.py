@@ -75,12 +75,12 @@ def evaluator_suffix(run_cfg) -> str:
     name = getattr(run_cfg, "evaluator", "exact")
     if name == "exact":
         return ""
-    if name == "tolerance":
-        return f"_tol{getattr(run_cfg, 'accept_epsilon', 0.03):g}"
-    criterion = getattr(run_cfg, "accept_criterion", "mahalanobis")
-    if criterion == "mahalanobis":
-        return f"_maha{getattr(run_cfg, 'accept_tau', 3.0):g}"
-    return f"_nats{getattr(run_cfg, 'accept_margin', 4.5):g}"
+    if name == "distance":
+        from baseline_spl.symbolic.evaluate import default_distance_threshold
+
+        epsilon = getattr(run_cfg, "accept_epsilon", None)
+        return f"_dist{(default_distance_threshold() if epsilon is None else epsilon):g}"
+    return f"_maha{getattr(run_cfg, 'accept_tau', 3.0):g}"
 
 
 def build(run_cfg) -> SearchHarness:
@@ -110,7 +110,28 @@ def main() -> None:
     if DreamCoderConfig.learn:
         harness.learn_all()
     if DreamCoderConfig.inference:
-        harness.infer_all()
+        # A finished demo-level run registers no concept, and `infer_all` raises on an empty
+        # library. Generalisation to unseen sizes is what "inference" means for that run, so
+        # route it there instead of failing.
+        if _is_finished_demo_run(harness):
+            harness.generalise_all()
+        else:
+            harness.infer_all()
+
+
+def _is_finished_demo_run(harness) -> bool:
+    '''A run whose artifacts say demo-level, with nothing registered to infer from.'''
+    import json
+    import os
+
+    stats = os.path.join(harness.configs.run_dir, "search_stats.json")
+    if not os.path.exists(stats):
+        return False
+    try:
+        granularity = json.loads(open(stats).read()).get("task_granularity")
+    except Exception:  # noqa: BLE001 - a malformed artifact is not a reason to crash here
+        return False
+    return granularity == "demo" and not harness.spl.concept_library.inductive_concepts
 
 
 if __name__ == "__main__":

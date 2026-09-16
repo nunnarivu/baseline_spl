@@ -75,6 +75,12 @@ class LatticeState:
         focus = (self.focus[0] + d[0], self.focus[1] + d[1], self.focus[2] + d[2])
         return LatticeState(focus, self.placements, self.cursor, self._tick())
 
+    def moved(self, direction: str, n: int) -> "LatticeState":
+        '''`n` cells in one application, SPL's shift_focus(direction, num_steps=n).'''
+        d = DIRECTIONS[direction]
+        focus = (self.focus[0] + n * d[0], self.focus[1] + n * d[1], self.focus[2] + n * d[2])
+        return LatticeState(focus, self.placements, self.cursor, self._tick(n))
+
     def placed(self) -> "LatticeState":
         if len(self.placements) >= MAX_PLACEMENTS:
             raise LatticeBudgetExceeded(f"exceeded {MAX_PLACEMENTS} placements")
@@ -127,9 +133,7 @@ def move(direction: str):
                 return s
             if count > MAX_PLACEMENTS:
                 raise LatticeBudgetExceeded(f"move distance {count} too large")
-            for _ in range(count):
-                s = s.shifted(direction)
-            return s
+            return s.moved(direction, count) if count > 0 else s
         return run
     return with_count
 

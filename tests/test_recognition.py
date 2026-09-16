@@ -21,7 +21,7 @@ Run: python -m baseline_spl.tests.test_recognition
 from __future__ import annotations
 
 from baseline_spl.symbolic import recognition
-from baseline_spl.symbolic.bridge import CONCEPT_REQUEST, from_term, grammar
+from baseline_spl.symbolic.bridge import CONCEPT_REQUEST, DEMO_REQUEST, from_term, grammar
 from baseline_spl.symbolic.ir import positions
 from baseline_spl.symbolic.lattice import EMPTY, LatticeState
 from baseline_spl.symbolic.oracles import ORACLES
@@ -89,6 +89,21 @@ def test_task_examples_have_the_shape_dreaming_needs():
         assert len(args) == 2, f"expected two argument types, got {args}"
 
 
+def _dream(extractor, request, attempts: int = 200):
+    '''Sample `attempts` programs of `request` and keep the ones that become real tasks.'''
+    g = grammar("standard")
+    dreamed = []
+    for _ in range(attempts):
+        program = g.sample(request, maximumDepth=6)
+        if program is None:
+            continue
+        task = extractor.taskOfProgram(program, request)
+        if task is not None and task.examples:
+            dreamed.append(task)
+    outputs = {tuple(y.positions) for t in dreamed for _xs, y in t.examples}
+    return dreamed, outputs
+
+
 def check_extractor_builds_and_dreams():
     '''Returns (dreams, distinct outputs) for main()'s report. The test wrapper below is what
     pytest collects -- a `test_` function that returns a value is a pytest warning, and the
@@ -101,23 +116,43 @@ def check_extractor_builds_and_dreams():
         assert extractor.tokenize(task.examples) is not None, \
             f"{task.name} was rejected by tokenize"
 
-    g = grammar("standard")
-    dreamed = []
-    for _ in range(60):
-        program = g.sample(CONCEPT_REQUEST, maximumDepth=6)
-        if program is None:
-            continue
-        task = extractor.taskOfProgram(program, CONCEPT_REQUEST)
-        if task is not None and task.examples:
-            dreamed.append(task)
+    dreamed, outputs = _dream(extractor, CONCEPT_REQUEST, attempts=60)
     assert dreamed, "dreaming produced no tasks at all"
-    outputs = {tuple(y.positions) for t in dreamed for _xs, y in t.examples}
     assert len(outputs) > 1, "every dream produced the same output; dreams are degenerate"
     return len(dreamed), len(outputs)
 
 
 def test_extractor_builds_and_dreams():
     check_extractor_builds_and_dreams()
+
+
+def check_closed_request_dreams():
+    '''Dreaming must work for the CLOSED request, which is the demo-level experiment's.
+
+    Split out from the concept-level check because it is a different code path with its own
+    failure, and because that failure is invisible from the outside. Upstream's
+    `taskOfProgram` rejects a dream whose examples all share an output; a `tstate -> tstate`
+    program has one input, this domain has one start state, so every closed dream is
+    degenerate by construction and the run logged "Got 0/500 valid samples" forever. The
+    override in `recognition.py` judges the output trace instead, as `TowerCNN.taskOfProgram`
+    does for DreamCoder's own closed domain.
+
+    Without this test the override -- the entire reason demo-level Sleep-R trains on anything
+    but its 32 real frontiers -- had no coverage at all, and `r2_demo16` was still carrying
+    `helmholtz_ratio = 0.0` to work around a bug that was already fixed.
+    '''
+    tasks = list(recognition.build_tasks(make_tasks()).values())
+    extractor = recognition.make_extractor(tasks)
+    dreamed, outputs = _dream(extractor, DEMO_REQUEST)
+    assert len(dreamed) >= 20, (
+        f"only {len(dreamed)}/200 closed dreams survived; upstream's degeneracy check is "
+        f"rejecting them, so demo-level Sleep-R would train on real frontiers alone")
+    assert len(outputs) > 1, "every closed dream produced the same output"
+    return len(dreamed), len(outputs)
+
+
+def test_closed_request_dreams():
+    check_closed_request_dreams()
 
 
 def check_training_yields_a_usable_per_task_grammar():
@@ -149,6 +184,7 @@ def main() -> int:
         ("tasks have the (parameter, state) shape dreaming needs",
          test_task_examples_have_the_shape_dreaming_needs),
         ("extractor builds and dreams non-degenerate tasks", check_extractor_builds_and_dreams),
+        ("closed (demo-level) request dreams too", check_closed_request_dreams),
         ("training yields usable per-task grammars",
          check_training_yields_a_usable_per_task_grammar),
     ]
@@ -156,7 +192,7 @@ def main() -> int:
         try:
             out = check()
             extra = ""
-            if label.startswith("extractor") and isinstance(out, tuple):
+            if isinstance(out, tuple) and len(out) == 2 and "dream" in label:
                 extra = f"  ({out[0]} dreams, {out[1]} distinct outputs)"
             print(f"  OK   {label}{extra}")
         except AssertionError as exc:

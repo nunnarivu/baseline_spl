@@ -1,7 +1,7 @@
 '''
 oracles.py
 
-Hand-written reference IR terms for every concept in SPLConfig.ALL_CONCEPTS.
+Hand-written reference IR terms for every concept in SPLConfig.ORIGINAL_CONCEPTS.
 
 Their purpose is to answer one question before any search is written: *is the IR expressive
 enough?* `tests/test_ir_fidelity.py` runs each against `run_gt_program` on the same parameter
@@ -99,9 +99,11 @@ def _build() -> Dict[str, Term]:
                       staircase_of("left", N))
 
     # Straight-line composition -- no focus restore, so this one is reachable at `minimal`.
-    isosceles_right_triangle = Seq(line("front", N), Shift("front"),
-                                   line("right", N), Shift("right"),
-                                   diagonal("left", "behind", N))
+    # GT: column(N), right, row(N-1), behind, diagonal_135(N-2). line() places its first block
+    # even for a count <= 0, as the GT row does, and diagonal() places nothing then, as GT does.
+    isosceles_right_triangle = Seq(line("front", N), Shift("right"),
+                                   line("right", sub(N, Const(1))), Shift("behind"),
+                                   diagonal("left", "behind", sub(N, Const(2))))
 
     # Rows of decreasing length laid out back-to-front, with a trailing single block.
     pins = Seq(

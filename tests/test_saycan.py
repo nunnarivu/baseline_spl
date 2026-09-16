@@ -151,6 +151,41 @@ def check_assign_offered_and_validated(failures):
         print("  OK   an action outside the candidate set is dropped")
 
 
+def check_multi_step_shift_validated(failures):
+    '''A multi-step shift_focus is filled in by the model; num_steps must lie within
+    max_shift_focus_steps, num_steps=1 normalises to the listed action, and the ideal
+    replay moves the focus num_steps cells.'''
+    agent = _agent()
+    fixed = list(StubActionSpace.PRIMITIVES) + [DONE]
+
+    good = agent._parse_scores('{"shift_focus(\\"RIGHT\\", num_steps=2)": 90, '
+                               '"shift_focus(\\"TOP\\", num_steps=1)": 40}',
+                               fixed, placed=[0], max_shift_steps=3)
+    if good != {'shift_focus("RIGHT", num_steps=2)': 90, 'shift_focus("TOP")': 40}:
+        failures.append(f"a valid multi-step shift was dropped or not normalised: {good}")
+    else:
+        print("  OK   multi-step shift_focus within the bound is accepted")
+
+    bad = agent._parse_scores('{"shift_focus(\\"RIGHT\\", num_steps=0)": 90, '
+                              '"shift_focus(\\"RIGHT\\", num_steps=4)": 80, '
+                              '"shift_focus(\\"UP\\", num_steps=2)": 70}',
+                              fixed, placed=[0], max_shift_steps=3)
+    plan = agent._parse_plan('{"plan": ["shift_focus(\\"LEFT\\", num_steps=3)", '
+                             '"shift_focus(\\"LEFT\\", num_steps=9)"]}', fixed, max_shift_steps=3)
+    if bad or plan != ['shift_focus("LEFT", num_steps=3)']:
+        failures.append(f"out-of-bound or unknown shifts should be dropped: {bad}, {plan}")
+    else:
+        print("  OK   num_steps of 0, above the bound, or an unknown direction is dropped")
+
+    place = "place_object_at_focus(objects.pop(0))"
+    multi = SayCanHarness._replay([place, 'shift_focus("RIGHT", num_steps=2)', place], 3)
+    chain = SayCanHarness._replay([place, 'shift_focus("RIGHT")', 'shift_focus("RIGHT")', place], 3)
+    if multi["positions"] != chain["positions"] or multi["focus_actions"] != chain["focus_actions"]:
+        failures.append(f"multi-step replay differs from the chained one: {multi} vs {chain}")
+    else:
+        print("  OK   multi-step shift replays like the chained single shifts")
+
+
 def check_scoring_failure_stops(failures):
     '''Unusable JSON is retried once, then the instruction stops — no invented action.'''
     agent = _agent(raw_reply="I think you should place a block, probably.")
@@ -376,6 +411,7 @@ def main() -> int:
     check_no_program_verdict(failures)
     check_context_sent_once(failures)
     check_assign_offered_and_validated(failures)
+    check_multi_step_shift_validated(failures)
     check_scoring_failure_stops(failures)
     check_state_lists_every_object(failures)
 

@@ -25,6 +25,7 @@ from typing import List
 import yaml
 
 from baseline_spl.common import codegen, dsl_prompt
+from baseline_spl.common.evaluator import ClassEvaluator
 from baseline_spl.common.harness import GeneratedConcept, log
 from baseline_spl.common.llm_backend import load_upstream_code_generator
 from baseline_spl.common.primitive_stats import build_stats_block
@@ -143,14 +144,28 @@ class Demo2CodeTextAgent:
                 "artifacts": str(Path(self.configs.run_dir) / "demo2code_artifacts"
                                  / artifact_name)}
 
+        # Scores upstream's class and the repair attempts together (best_code spans both).
+        evaluator = (ClassEvaluator(shared, demos, sketch_infos)
+                     if self.configs.use_evaluator_feedback else None)
+        if evaluator is not None:
+            info["evaluator"] = evaluator.record
+
         # Upstream has no structural validation of its own; apply the same check and the
         # same retry budget every other baseline gets, using the produced spec as context.
+        problem = "which was not a valid concept class"
         try:
             codegen.validate(code)
             if concept:
                 code = codegen.ensure_class_name(code, concept)
                 codegen.validate(code)
-            return self._result(code, concept, sketch_infos, shared, info)
+            if evaluator is None:
+                return self._result(code, concept, sketch_infos, shared, info)
+            passed, _score, report = evaluator(code)
+            if passed:
+                return self._result(code, concept, sketch_infos, shared, info)
+            log(f"[demo2code-text] upstream class did not reproduce the demonstrations; "
+                f"retrying with the report.\n{report}")
+            problem = f"which did not reproduce the demonstrations.\nEvaluation report: {report}"
         except Exception as exc:  # noqa: BLE001
             log(f"[demo2code-text] upstream output invalid ({exc}); retrying structurally.")
 
@@ -160,10 +175,11 @@ class Demo2CodeTextAgent:
                                            library_block=library_block),
             (f"{dsl_prompt.build_task_block(demo_specs)}\n"
              f"# Task specification derived from the demonstrations\n{spec}\n\n"
-             f"# A previous attempt produced this, which was not a valid concept class\n"
+             f"# A previous attempt produced this, {problem}\n"
              f"```python\n{code[:4000]}\n```\n"),
             wanted_name=concept,
             max_retries=self.configs.max_code_retries,
+            evaluator=evaluator,
             log=log,
         )
         if repaired is None:

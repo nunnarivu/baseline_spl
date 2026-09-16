@@ -31,6 +31,8 @@ from baseline_spl.common.harness import BaselineHarness, GeneratedConcept, log
 from baseline_spl.symbolic import driver
 from baseline_spl.symbolic.lower import lower, saved_is_exact
 from baseline_spl.symbolic import evaluate
+from baseline_spl.symbolic.search import Solution
+from baseline_spl.symbolic.settings import SearchSettings
 from baseline_spl.symbolic.tasks import build_tasks, summarise_demo
 
 
@@ -88,7 +90,7 @@ class SearchHarness(BaselineHarness):
         cfg = self.configs
         dataloader = build_inductive_structure_dataloader(
             cfg.dataset_name, cfg.train_dataset_dir, cfg.assets_dir,
-            camera_view="fixed_robot_diag_45", batch_size=1,
+            camera_view=cfg.camera_view, batch_size=1,
             num_workers=getattr(cfg, "num_workers", 4), shuffle=False,
             # B3-a never needs pixels; B3-b does when its demonstration modality includes
             # images. Loading them unconditionally would slow the control run for nothing.
@@ -108,6 +110,17 @@ class SearchHarness(BaselineHarness):
                         summarise_demo(data, executor, want_srn)
                     except Exception as exc:  # noqa: BLE001
                         log(f"  cannot summarise demo {data.get('demo_id')} of "
+                            f"<{data.get('concept')}>: {type(exc).__name__}: {exc}")
+                        continue
+                    # Sketch now: filter() reads the demo's scene, which is released just below.
+                    # Guarded for the same reason `summarise_demo` is: one concept the sketch
+                    # cannot handle must cost that concept, not the whole run. The dataset keeps
+                    # growing, so "a new concept broke loading" has to degrade to a skip.
+                    try:
+                        data["sketch_info"] = self.shared_sketch.signature(
+                            data["language_instruction"], data)
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"  cannot sketch demo {data.get('demo_id')} of "
                             f"<{data.get('concept')}>: {type(exc).__name__}: {exc}")
                         continue
                     for key in self.HEAVY_KEYS:
@@ -138,8 +151,257 @@ class SearchHarness(BaselineHarness):
         override = getattr(cfg, "int_literals_upto", None)
         if override:
             return int(override)
-        largest = max((n for task in tasks for n in task.parameters), default=6)
+        # Every integer of every argument tuple, not just the first: `room(4, 3, 2)` needs a
+        # ceiling covering 4, and a concept whose second argument is the large one would
+        # otherwise get a grammar too small to express it.
+        from baseline_spl.symbolic.ir import args as _args
+
+        largest = max((v for task in tasks for n in task.parameters for v in _args(n)),
+                      default=6)
         return max(12, 2 * int(largest) + 1)
+
+    def _register_and_score(self, pending, used_demos, result, tasks, cfg) -> None:
+        """Register each concept's program and score it, reloading geometry in chunks.
+
+        Scoring needs the meshes back -- `_evaluate_training_metrics` runs the ground-truth
+        program and the physics stability check against real geometry -- but reloading every
+        concept at once would undo the whole point of streaming. So reload a window, score it,
+        release it, and move on: the peak stays at `scoring_chunk` concepts however many the
+        dataset holds.
+
+        Reload when the demonstrations in hand have NO GEOMETRY, not when this run happened to
+        release some. Keying off the release count was wrong the moment streaming started doing
+        the releasing: the counter came back 0, the reload was skipped, and scoring ran on
+        mesh-less demos -- `program_accuracy` still worked (it compares against
+        `run_gt_program`) while `plan_accuracy`, `mean_iou` and the stability checks all went
+        silently to None.
+        """
+        needs_reload = any(demo.get("meshes") is None
+                           for demos in pending.values() for demo in demos)
+        chunk = max(1, int(getattr(cfg, "scoring_chunk", 8)))
+        names = list(pending)
+        for start in range(0, len(names), chunk):
+            window = names[start:start + chunk]
+            if needs_reload:
+                log(f"Reloading demonstrations for scoring "
+                    f"({start + 1}-{start + len(window)} of {len(names)}).")
+                window_demos = self._load_demos(window)
+            else:
+                window_demos = OrderedDict((c, pending[c]) for c in window)
+            self._score_window(window_demos, used_demos, result, tasks, cfg)
+            window_demos = None
+            self._reclaim()
+
+    def generalise_all(self) -> None:
+        """Measure generalisation to unseen sizes over a FINISHED demo-level run.
+
+        Post-processing, so `learn = False`: the solved closed programs are read back from
+        `search_stats.json` rather than re-searched. Two arms over one held-out set, each
+        behind its own config knob:
+
+          arm A  `heldout_enumeration`      DreamCoder's own route -- enumerate each held-out
+                                            (concept, size) task afresh under the learnt
+                                            library, exactly as `dreamcoder.py:567` does.
+          arm B  `recover_concept_classes`  anti-unify the solved demos into a parameterised
+                                            class, then instantiate it at the held-out size.
+
+        `infer_all` cannot serve here: it raises when no concept is registered, which is
+        precisely the state a demo-level run leaves behind.
+        """
+        from dreamcoder.program import Program
+
+        from baseline_spl.symbolic import heldout
+        from baseline_spl.symbolic.bridge import grammar, to_term
+
+        cfg = self.configs
+        stats_path = os.path.join(cfg.run_dir, "search_stats.json")
+        if not os.path.exists(stats_path):
+            log(f"No search_stats.json in {cfg.run_dir}; nothing to generalise from.")
+            return
+        stats = json.loads(open(stats_path).read())
+        if stats.get("task_granularity") == "concept":
+            log("This run is concept-level; its programs already take the size as an "
+                "argument, so there is nothing to recover.")
+            return
+
+        concepts = list(cfg.concepts_to_learn or cfg.concepts_space)
+        sizes = tuple(getattr(cfg, "heldout_sizes", (8, 10, 12)))
+
+        # The tasks carry the parameters and SRN tables recovery needs, and the artifacts do
+        # not record them; rebuilding is cheaper than a second bespoke path.
+        demos_by_concept = self._load_demos(concepts, summarise=True)
+        pending = OrderedDict((c, d) for c, d in demos_by_concept.items() if d)
+        # `.get`: a demo whose sketch failed during loading carries none, and one such
+        # demo must not KeyError the run.
+        sketches = {c: [d.get("sketch_info") for d in demos]
+                    for c, demos in pending.items()}
+        tasks, used_demos, _skipped = build_tasks(
+            pending, sketches, granularity="demo",
+            selection=getattr(cfg, "demo_selection", "distinct_params"),
+            demos_per_concept=cfg.num_demos_per_concept,
+            observation_mode=self.observation_mode,
+            executor=self.spl.executor if self.observation_mode == "continuous" else None)
+
+        # Build the grammar FIRST: `extra_int_literals` registers 3..ceiling as primitives,
+        # and without them `Program.parse` cannot read back a closed program like `(loop 6 ...)`.
+        # Doing this after the parse loop silently lost all 18 solved programs.
+        g = grammar(getattr(cfg, "grammar_level", "standard"),
+                    getattr(cfg, "use_continuation_type", True),
+                    int_literals_upto=self._literal_ceiling(tasks, cfg))
+
+        # Rebuild the solved solutions from the artifact, with their terms.
+        result = driver.RunResult()
+        for name, entry in stats.get("per_task", {}).items():
+            if entry.get("status") != "solved" or not entry.get("program"):
+                continue
+            solution = Solution(task=name)
+            try:
+                program = Program.parse(entry["program"])
+                solution.term = to_term(program, concept_level=False)
+            except Exception as exc:  # noqa: BLE001
+                log(f"  {name}: solved program will not translate ({exc}); skipping")
+                continue
+            # The frontier is what makes `Solution.status` say "solved" -- it is derived from
+            # `exact`, which is `bool(self.frontier)`. Setting only `term` and `distance` left
+            # every rebuilt solution reporting "unsolved", so recovery saw nothing to work with
+            # and reported 0/0 while 18 programs sat right there.
+            solution.frontier = [(-float(entry.get("mdl") or 0.0), program)]
+            solution.distance = 0.0
+            result.solutions[name] = solution
+        log(f"Read {len(result.solutions)} solved closed program(s) from search_stats.json")
+
+        recovered = self._recover_concept_classes(result, tasks, used_demos, cfg, log) \
+            if getattr(cfg, "recover_concept_classes", True) else {}
+
+        # Register and score the recovered classes, so a demo-level run gets the metrics that
+        # were structurally undefined for it -- `program_accuracy` above all, which proves the
+        # class equivalent to the ground-truth program rather than merely fitting its demos.
+        if recovered:
+            for concept, term in recovered.items():
+                demo_solutions = [s for name, s in result.solutions.items()
+                                  if name.rsplit("_", 1)[0] == concept and s.status == "solved"]
+                best = max(demo_solutions, key=lambda s: s.log_prior, default=None)
+                entry = Solution(task=concept)
+                if best is not None:
+                    entry.frontier = list(best.frontier)
+                entry.term, entry.distance = term, 0.0
+                result.solutions[concept] = entry
+            scored = OrderedDict((c, pending[c]) for c in recovered if c in pending)
+            self._register_and_score(
+                scored, used_demos, result, self._concept_level_tasks(tasks, recovered,
+                                                                      used_demos), cfg)
+            if cfg.concept_save_path:
+                self.spl.save(cfg.concept_save_path)
+
+        # No evaluator is passed: the held-out tasks carry oracle-generated integer cells, so
+        # `heldout` scores them exactly. Handing over this run's continuous evaluator scored
+        # every one as None -- it needs SRN tables, which oracle targets do not have -- and
+        # arm A reported 0/48 with nothing visibly wrong.
+        results = heldout.run(
+            g, concepts, sizes,
+            recovered=recovered if recovered else None,
+            search=bool(getattr(cfg, "heldout_enumeration", True)),
+            timeout=float(getattr(cfg, "heldout_timeout", 300.0)),
+            cpus=getattr(cfg, "cpus", 1), log=log)
+
+        summary = heldout.summarise(results)
+        summary["recovered_concepts"] = sorted(recovered)
+        summary["heldout_sizes"] = list(sizes)
+        # Arm B uses the concept grouping and size labels that DreamCoder's task formulation
+        # never receives, so the artifact says so rather than leaving it to be inferred.
+        summary["disclosure"] = (
+            "class_solved is arm B: our anti-unification post-processing, which consumes the "
+            "concept grouping and demo size labels. It is NOT published DreamCoder. "
+            "search_solved is arm A, DreamCoder's own route (enumerate the held-out task).")
+        self._write("heldout_metrics.json", summary)
+        log(f"Held-out generalisation -> {os.path.join(cfg.run_dir, 'heldout_metrics.json')}")
+
+    def _recover_concept_classes(self, result, tasks, used_demos, cfg, log) -> "OrderedDict":
+        """Anti-unify each concept's SOLVED demo programs into a parameterised class.
+
+        Only solved demos are used. An `approximate` program is a near miss, and generalising
+        two near misses yields a confident-looking class that is simply wrong -- measured on
+        `staircase`, whose two approximate solutions differ in the direction as well as the
+        size, inventing a spurious direction argument.
+
+        The gate is this run's own evaluator, so a recovered class must reproduce every demo
+        under the same acceptance test the search used. `generalise.reproduces` would compare
+        lattice cells only, which would be the wrong question in a continuous run.
+        """
+        from baseline_spl.symbolic import generalise
+        from baseline_spl.symbolic.bridge import from_term
+
+        by_concept = OrderedDict()
+        for concept, ids in used_demos.items():
+            owned = [t for t in tasks if str(t.demo_ids and t.demo_ids[0]) in set(map(str, ids))
+                     and t.name.rsplit("_", 1)[0] == concept]
+            solved = [(t, result.solutions.get(t.name)) for t in owned]
+            solved = [(t, s) for t, s in solved if s is not None and s.status == "solved"
+                      and s.term is not None]
+            if not solved:
+                continue
+            by_concept[concept] = solved
+
+        recovered = OrderedDict()
+        for concept, solved in by_concept.items():
+            terms = [s.term for _t, s in solved]
+            params = [n for t, _s in solved for n, _ in t.examples]
+            probe = self._concept_task(concept, [t for t, _s in solved])
+
+            def gate(candidate, _probe=probe):
+                try:
+                    return self.evaluator.accepts(
+                        self.evaluator.score(from_term(candidate, concept_level=True), _probe))
+                except Exception:  # noqa: BLE001 - a wrong generalisation may fail any way
+                    return False
+
+            outcome = generalise.recover(
+                concept, terms, params, accepts=gate,
+                allow_single_demo=getattr(cfg, "recover_allow_single_demo", True),
+                holdout_validate=getattr(cfg, "recover_holdout_validate", True))
+            if outcome.ok:
+                recovered[concept] = outcome.term
+                log(f"  <{concept}>: recovered a parameterised class from "
+                    f"{len(terms)} solved demo(s) at {params} [{outcome.route}]")
+            else:
+                log(f"  <{concept}>: no class recovered -- "
+                    f"{generalise.REASONS.get(outcome.reason, outcome.reason)}")
+
+        log(f"  recovered {len(recovered)}/{len(by_concept)} concept(s) with solved demos")
+        return recovered
+
+    @staticmethod
+    def _concept_task(concept: str, owned):
+        """A concept-level task built from the demo-level ones, for validation and lowering.
+
+        Each demo task holds exactly one example; concatenating them is precisely the
+        concept-level task the parameterised search would have been given. `srn_tables` must
+        come along or the continuous evaluators score every example as None.
+        """
+        from baseline_spl.symbolic.search import SearchTask
+
+        first = owned[0]
+        return SearchTask(
+            name=concept,
+            examples=[t.examples[0] for t in owned],
+            param_name=first.param_name,
+            demo_ids=tuple(d for t in owned for d in t.demo_ids),
+            instruction=first.instruction,
+            observation_mode=first.observation_mode,
+            srn_tables=[t.srn_tables[0] for t in owned if t.srn_tables],
+            closed=False)
+
+    def _concept_level_tasks(self, tasks, recovered, used_demos):
+        """Concept-level tasks for the recovered concepts; `_score_window` looks up
+        `param_name` by `t.name == concept`."""
+        out = []
+        for concept in recovered:
+            owned = [t for t in tasks
+                     if t.demo_ids and str(t.demo_ids[0]) in set(map(str, used_demos[concept]))
+                     and t.name.rsplit("_", 1)[0] == concept]
+            if owned:
+                out.append(self._concept_task(concept, owned))
+        return out
 
     @staticmethod
     def _reclaim() -> None:
@@ -181,20 +443,7 @@ class SearchHarness(BaselineHarness):
                         touched = True
                 stripped += bool(touched)
 
-        # Dropping the references is not enough on its own. CPython returns freed arenas to
-        # its own allocator, not to the OS, so RSS stays at ~53 GB and every later `fork`
-        # still maps that footprint -- measured: parent RSS 53.4 GB with a PSS of only
-        # 3.3 GB, i.e. the pages were shared rather than copied (so COW was working) but the
-        # machine was still accounting for them. Returning them explicitly is what actually
-        # lets several runs coexist.
-        gc.collect()
-        try:
-            import ctypes
-
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception as exc:  # noqa: BLE001 - glibc-only; never fatal
-            log(f"malloc_trim unavailable ({type(exc).__name__}); "
-                f"freed memory stays in the allocator.")
+        cls._reclaim()          # dropping references is not enough -- see _reclaim
         return stripped
 
     def learn_all(self) -> None:
@@ -208,8 +457,7 @@ class SearchHarness(BaselineHarness):
         for concept, demos in demos_by_concept.items():
             if not demos:
                 log(f"No demonstrations found for <{concept}>; skipping.")
-            elif (concept in self.spl.concept_library.inductive_concepts
-                    or concept in self._metric_records):
+            elif cfg.ignore_learnt_concepts and concept in self.spl.concept_library.inductive_concepts:
                 log(f"<{concept}> already learned; skipping.")
             else:
                 pending[concept] = demos
@@ -217,16 +465,18 @@ class SearchHarness(BaselineHarness):
             log("Nothing left to learn.")
             return
 
-        # The sketch supplies the parameter name and value the task needs. It is cached by
-        # instruction, so `learn_concept` re-reading it below costs nothing.
-        log(f"Sketching {sum(len(d) for d in pending.values())} instruction(s)")
-        sketches = {c: [self.shared_sketch.signature(d["language_instruction"]) for d in demos]
+        # The sketch supplies the parameter name and value the task needs. `_load_demos` took it
+        # while the scene was still loaded; it is cached by instruction, so `learn_concept`
+        # re-reading it below costs no LLM call.
+        # `.get`: a demo whose sketch failed during loading carries none, and one such
+        # demo must not KeyError the run.
+        sketches = {c: [d.get("sketch_info") for d in demos]
                     for c, demos in pending.items()}
 
         evaluator, observation_mode = self.evaluator, self.observation_mode
         log(f"Observations: {observation_mode}; acceptance: {evaluator.describe()}")
 
-        tasks, used_demos = build_tasks(
+        tasks, used_demos, skipped = build_tasks(
             pending, sketches,
             granularity=getattr(cfg, "task_granularity", "concept"),
             selection=getattr(cfg, "demo_selection", "distinct_params"),
@@ -236,6 +486,27 @@ class SearchHarness(BaselineHarness):
             # system uses rather than a second one that could drift from it.
             executor=self.spl.executor if observation_mode == "continuous" else None)
         self._write(f"demo_selection.json", used_demos)
+
+        # A concept the grammar cannot type gets a record, not silence. Without one it would
+        # simply be absent from the results, indistinguishable from a concept that was searched
+        # and failed -- which misreports the baseline's coverage.
+        for concept, reason in skipped.items():
+            # Two different things end up here, and conflating them would hide the second.
+            # "not an integer" is the EXPECTED case -- an argument the grammar has no type for,
+            # which is a property of the concept. Anything else is a failure worth reading, so
+            # it keeps the exception type in the record rather than being filed as by-design.
+            expected = "not an integer" in reason
+            log(f"<{concept}>: {'inexpressible' if expected else 'could not be prepared'} "
+                f"for this baseline -- {reason}")
+            self._metric_records[concept] = {
+                "concept": concept,
+                "status": "inexpressible" if expected else "task_build_failed",
+                "reason": reason,
+                "search_status": "not_attempted", "program_accuracy": None,
+                "program_verdict": "no_program", "evaluator": evaluator.name}
+            pending.pop(concept, None)
+        if skipped:
+            self._flush()
         granularity = getattr(cfg, "task_granularity", "concept")
         for concept, ids in used_demos.items():
             # Concept-level names a task after its concept; demo-level names it
@@ -261,31 +532,12 @@ class SearchHarness(BaselineHarness):
             f"({released} demonstration(s) still holding it at this point)." )
 
         t0 = time.perf_counter()
-        result = driver.run(
-            tasks,
-            **hooks,
-            evaluator=evaluator,
-            level=getattr(cfg, "grammar_level", "standard"),
-            continuation=getattr(cfg, "use_continuation_type", True),
-            int_literals_upto=self._literal_ceiling(tasks, cfg),
-            iterations=getattr(cfg, "search_iterations", 3),
-            timeout=getattr(cfg, "enumeration_timeout", 60.0),
-            max_mdl=getattr(cfg, "max_mdl", 100.0),
-            use_library=getattr(cfg, "use_library", True),
-            pseudo_counts=getattr(cfg, "pseudo_counts", 1.0),
-            max_arity=getattr(cfg, "stitch_max_arity", 3),
-            maximum_frontier=getattr(cfg, "maximum_frontier", 5),
-            cpus=getattr(cfg, "cpus", 1),
-            use_recognition=getattr(cfg, "use_recognition", True),
-            recognition_epochs=getattr(cfg, "recognition_epochs", None),
-            recognition_steps=getattr(cfg, "recognition_steps", 10000),
-            recognition_timeout=getattr(cfg, "recognition_timeout", 1800.0),
-            recognition_hidden=getattr(cfg, "recognition_hidden", 64),
-            recognition_contextual=getattr(cfg, "recognition_contextual", True),
-            recognition_bias_optimal=getattr(cfg, "recognition_bias_optimal", True),
-            recognition_auxiliary_loss=getattr(cfg, "recognition_auxiliary_loss", True),
-            helmholtz_ratio=getattr(cfg, "helmholtz_ratio", 0.5),
-            log=log)
+        settings = SearchSettings.from_config(cfg)
+        # Derived from the tasks, not the config, so a larger dataset widens the grammar on
+        # its own; `int_literals_upto` in the config overrides for an ablation.
+        settings.int_literals_upto = self._literal_ceiling(tasks, cfg)
+
+        result = driver.run(tasks, settings, evaluator=evaluator, log=log, **hooks)
         search_seconds = time.perf_counter() - t0
 
         stats = result.stats()
@@ -300,25 +552,46 @@ class SearchHarness(BaselineHarness):
         if granularity != "concept":
             # Demo-level solutions are CLOSED programs -- request type `tstate -> tstate`,
             # with the structure's size baked in as a literal. That is DreamCoder as
-            # published, and it is the point of running this: their own benchmarks are shaped
-            # this way ("arch leg 1" ... "arch leg 8" are eight separate tasks, none of them
-            # parameterised). But a closed program cannot be lowered into an SPL concept
-            # class, which takes the size as an argument, so there is nothing to register and
-            # `program_accuracy` is not defined for it. Recovering a parameterised form would
-            # mean anti-unifying each concept's demo-level solutions, which is a separate
-            # piece of work and not what this run is measuring.
+            # published: their benchmarks are shaped this way ("arch leg 1" ... "arch leg 8"
+            # are eight separate tasks, none parameterised).
             #
-            # So this run reports the SEARCH result only -- how many closed tasks the
-            # enumerator solves, and how deep it reaches -- which is exactly the quantity that
-            # answers "was the parameterised framing handicapping the search?". Compare
-            # search_stats.json against the matching concept-level run.
+            # A closed program cannot be lowered into an SPL class on its own, because the
+            # class takes the size as an argument and the program has none. But a concept's
+            # SOLVED demos differ only in that size, so anti-unifying them recovers the
+            # parameterised form (`generalise.py`). That is strictly more than published
+            # DreamCoder does -- it uses the concept grouping and the size labels, which
+            # DreamCoder's task formulation never receives -- so it is reported as a
+            # disclosed variant and gated behind `recover_concept_classes`.
             solved = len(result.solved)
-            log(f"Demo-level run: {solved}/{len(tasks)} task(s) solved. Skipping concept "
-                f"registration and program_accuracy -- a closed program has no parameter to "
-                f"lower into an SPL class. See search_stats.json for the comparable numbers.")
-            if cfg.concept_save_path:
-                self.spl.save(cfg.concept_save_path)
-            return
+            log(f"Demo-level run: {solved}/{len(tasks)} task(s) solved.")
+            recovered = self._recover_concept_classes(result, tasks, used_demos, cfg, log) \
+                if getattr(cfg, "recover_concept_classes", True) else {}
+            if not recovered:
+                log("  no concept class recovered; reporting the search result only. "
+                    "See search_stats.json for the comparable numbers.")
+                if cfg.concept_save_path:
+                    self.spl.save(cfg.concept_save_path)
+                return
+            # Fall through: the recovered classes are parameterised, so the concept-level
+            # registration and scoring path below applies to them unchanged.
+            # `result.solutions` is keyed by TASK name (`row_0000`), so a concept-level entry
+            # has to be synthesised for `_score_window` to find. It carries the recovered term
+            # and the best of the concept's demo frontiers, so the reported MDL is a real
+            # search result rather than an invented one.
+            for concept, term in recovered.items():
+                demo_solutions = [s for name, s in result.solutions.items()
+                                  if name.rsplit("_", 1)[0] == concept and s.status == "solved"]
+                best = max(demo_solutions, key=lambda s: s.log_prior, default=None)
+                entry = Solution(task=concept)
+                if best is not None:
+                    entry.frontier = list(best.frontier)
+                    entry.seconds = best.seconds
+                    entry.programs_tried = best.programs_tried
+                entry.term = term
+                entry.distance = 0.0
+                result.solutions[concept] = entry
+            pending = OrderedDict((c, pending[c]) for c in recovered if c in pending)
+            tasks = self._concept_level_tasks(tasks, recovered, used_demos)
 
         # Register and score whatever was found. An unsolved concept is recorded, not skipped:
         # an empty column by construction is the result, and hiding it would misreport it.
@@ -334,21 +607,7 @@ class SearchHarness(BaselineHarness):
         # on mesh-less demos -- `program_accuracy` still worked (it compares against
         # `run_gt_program`) while `plan_accuracy`, `mean_iou` and the stability checks all went
         # silently to None.
-        needs_reload = any(demo.get("meshes") is None
-                           for demos in pending.values() for demo in demos)
-        chunk = max(1, int(getattr(cfg, "scoring_chunk", 8)))
-        names = list(pending)
-        for start in range(0, len(names), chunk):
-            window = names[start:start + chunk]
-            if needs_reload:
-                log(f"Reloading demonstrations for scoring "
-                    f"({start + 1}-{start + len(window)} of {len(names)}).")
-                window_demos = self._load_demos(window)
-            else:
-                window_demos = OrderedDict((c, pending[c]) for c in window)
-            self._score_window(window_demos, used_demos, result, tasks, cfg)
-            window_demos = None
-            self._reclaim()
+        self._register_and_score(pending, used_demos, result, tasks, cfg)
 
         if cfg.concept_save_path:
             self.spl.save(cfg.concept_save_path)
@@ -383,6 +642,8 @@ class SearchHarness(BaselineHarness):
                 self._flush()
                 continue
 
+            from baseline_spl.symbolic.ir import args as _args
+
             param = next(t for t in tasks if t.name == concept).param_name
             code = lower(solution.term, concept, param)
             exact, why = saved_is_exact(solution.term)
@@ -390,9 +651,15 @@ class SearchHarness(BaselineHarness):
                 log(f"<{concept}>: WARNING focus restore is not exactly lowerable ({why}); "
                     f"the class may fail on the live executor.")
 
+            # One entry per integer argument. A 2- or 3-argument concept whose attributes named
+            # only the first would be instantiated with the wrong signature by
+            # `check_program_equivalence`, which binds by position.
+            attributes = {str(n): int for n in _args(param)}
+            attributes["objects"] = list
+
             self.agent.add(concept, GeneratedConcept(
                 concept_name=concept,
-                attributes={param: int, "objects": list},
+                attributes=attributes,
                 code=code,
                 info={"mdl": -solution.log_prior, "status": solution.status,
                       "program": str(solution.program),

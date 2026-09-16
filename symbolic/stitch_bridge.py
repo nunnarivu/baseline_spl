@@ -118,11 +118,9 @@ def eta_long(program: Program, request=None) -> Optional[Program]:
     STITCH for eta-long output; that flag segfaults here (see `compress`), so normalise on
     our side instead, exactly as `sample_generator.py:631` does.
 
-    `request` defaults to the program's OWN inferred type rather than to CONCEPT_REQUEST.
-    Assuming concept-level silently broke demo-level: a closed program is `tstate -> tstate`,
-    the visitor rejected it against `tint -> tstate -> tstate`, and every caller read the
-    resulting None as "this program cannot be normalised" -- so closed solutions produced no
-    training frontiers and had an infinite MDL, with nothing raised anywhere.
+    `request` defaults to the program's OWN inferred type. Assuming the concept-level request
+    rejects every closed (`tstate -> tstate`) program, and callers read the resulting None as
+    "cannot be normalised" -- no training frontiers and infinite MDL, silently.
     '''
     from dreamcoder.program import EtaLongVisitor
     try:
@@ -133,13 +131,28 @@ def eta_long(program: Program, request=None) -> Optional[Program]:
         return None
 
 
-def program_mdl(grammar: Grammar, program: Program) -> float:
-    '''Description length of one program, or +inf if the grammar cannot express it.'''
-    normalised = eta_long(program)
+def program_mdl(grammar: Grammar, program: Program, request=None) -> float:
+    '''Description length of one program, or +inf if the grammar cannot express it.
+
+    `request` is the TYPE the program is scored at, and it must be the task's own: a demo-level
+    program is closed (`tstate -> tstate`), and scoring it as `tint -> tstate -> tstate` gives
+    -inf, i.e. infinite MDL. That is not a loud failure -- `corpus_mdl` then returns inf for the
+    baseline AND every candidate, so `best_compression`'s `score < best_score` is `inf < inf`,
+    and no abstraction is ever adopted. Both 12-hour demo-level runs learned nothing for this
+    reason and logged only `mean solved MDL now inf`.
+
+    Defaults to the concept-level request so existing concept-level callers are unchanged; every
+    caller inside this package passes the task's request explicitly.
+    '''
+    if request is None:
+        request = CONCEPT_REQUEST
+    # The same request for both: eta-normalising at one type and scoring at another is the
+    # mismatch that produced the silent -inf.
+    normalised = eta_long(program, request)
     if normalised is None:
         return float("inf")
     try:
-        prior = grammar.logLikelihood(CONCEPT_REQUEST, normalised)
+        prior = grammar.logLikelihood(request, normalised)
     except Exception:  # noqa: BLE001
         return float("inf")
     if prior is None or prior == float("-inf"):
@@ -147,15 +160,19 @@ def program_mdl(grammar: Grammar, program: Program) -> float:
     return -prior
 
 
-def corpus_mdl(grammar: Grammar, solved: Sequence[Tuple[str, Program]]) -> float:
+def corpus_mdl(grammar: Grammar, solved: Sequence[Tuple[str, Program]],
+               requests: Optional[Dict[str, object]] = None) -> float:
     '''Total description length of the solved programs under a grammar.
 
     Lower is better. Returns +inf if any program is unreachable, which is what makes this
     safe to use as an acceptance test: an abstraction that breaks a solution is rejected.
+
+    `requests` maps task name -> request. `solved` is keyed by task name, so a mixed corpus
+    (some concept-level, some closed) scores each program at its own type.
     '''
     total = 0.0
-    for _name, program in solved:
-        cost = program_mdl(grammar, program)
+    for name, program in solved:
+        cost = program_mdl(grammar, program, (requests or {}).get(name))
         if cost == float("inf"):
             return float("inf")
         total += cost
@@ -165,6 +182,7 @@ def corpus_mdl(grammar: Grammar, solved: Sequence[Tuple[str, Program]]) -> float
 def best_compression(grammar: Grammar, solved: Sequence[Tuple[str, Program]], *,
                      candidate_iterations: Sequence[int] = (1, 2, 3, 5, 10),
                      max_arity: int = 3, level: str = "standard",
+                     requests: Optional[Dict[str, object]] = None,
                      ) -> Tuple[Compression, Grammar]:
     '''Choose how many abstractions to keep by description length.
 
@@ -194,7 +212,7 @@ def best_compression(grammar: Grammar, solved: Sequence[Tuple[str, Program]], *,
     Returns (chosen compression, grammar to search with). An empty Compression means no
     abstraction paid for itself this round, which is a legitimate outcome.
     '''
-    baseline = corpus_mdl(grammar, solved)
+    baseline = corpus_mdl(grammar, solved, requests)
     best_result, best_grammar, best_score = Compression(), grammar, baseline
 
     for iterations in candidate_iterations:
@@ -214,7 +232,7 @@ def best_compression(grammar: Grammar, solved: Sequence[Tuple[str, Program]], *,
             except Exception:  # noqa: BLE001
                 rewritten.append((name, original))
 
-        score = corpus_mdl(candidate_grammar, rewritten)
+        score = corpus_mdl(candidate_grammar, rewritten, requests)
         if score < best_score - 1e-9:
             best_result, best_grammar, best_score = result, candidate_grammar, score
 
@@ -246,7 +264,8 @@ def _invented(grammar: Grammar) -> List[Invented]:
 
 
 def reweight(grammar: Grammar, solved: Sequence[Tuple[str, Program]],
-             pseudo_counts: float = 1.0, log=None) -> Grammar:
+             pseudo_counts: float = 1.0, log=None,
+             requests: Optional[Dict[str, object]] = None) -> Grammar:
     '''Re-fit the production probabilities to the solutions found so far.
 
     DreamCoder's other sleep step: productions that appear in solutions get cheaper, unused
@@ -275,18 +294,22 @@ def reweight(grammar: Grammar, solved: Sequence[Tuple[str, Program]],
     frontiers = []
     skipped = []
     for name, program in solved:
-        normalised = eta_long(program)
+        # The task's own request, not the concept-level one: a closed program scored at
+        # `tint -> tstate -> tstate` yields -inf, `skipped` collects every task, and the step
+        # silently no-ops with "nothing usable" -- which is what demo-level runs did.
+        request = (requests or {}).get(name) or CONCEPT_REQUEST
+        normalised = eta_long(program, request)
         if normalised is None:
             skipped.append(name)
             continue
         try:
-            prior = grammar.logLikelihood(CONCEPT_REQUEST, normalised)
+            prior = grammar.logLikelihood(request, normalised)
         except Exception as exc:  # noqa: BLE001
             skipped.append(f"{name} ({exc})")
             continue
         frontiers.append(Frontier([FrontierEntry(program=normalised, logLikelihood=0.0,
                                                  logPrior=prior)],
-                                  task=_StubTask(name)))
+                                  task=_StubTask(name, request)))
 
     if skipped and log:
         log(f"  re-weighting skipped {len(skipped)} program(s): {', '.join(skipped[:4])}")
@@ -306,9 +329,9 @@ def reweight(grammar: Grammar, solved: Sequence[Tuple[str, Program]],
 class _StubTask:
     '''Frontier requires a task with a `request`; insideOutside only reads that.'''
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, request=None):
         self.name = name
-        self.request = CONCEPT_REQUEST
+        self.request = request or CONCEPT_REQUEST
 
     def __hash__(self):
         return hash(self.name)

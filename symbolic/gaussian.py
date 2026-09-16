@@ -62,16 +62,19 @@ class GaussianState:
     table           - {direction: (mean, variance)} from srn.py; constant for a demo
     observations    - the demo's observed centroids, used by `saved` (see `restored`)
     resync          - whether `saved` snaps to the observation or to the prediction
+    per_step_variance - whether `moved` adds the variance once per step or once per call
+                      (SPL's `accumulate_shift_variance_per_step`)
 
     Immutable: every primitive returns a new state.
     '''
 
     __slots__ = ("mu", "var", "placements", "cursor", "steps", "table",
-                 "observations", "resync")
+                 "observations", "resync", "per_step_variance")
 
     def __init__(self, table: Dict[str, Tuple[Vec, Vec]], mu: Vec = ZERO,
                  var: Vec = RESET_VAR, placements: Tuple = (), cursor: int = 0,
-                 steps: int = 0, observations: Sequence[Vec] = (), resync: bool = True):
+                 steps: int = 0, observations: Sequence[Vec] = (), resync: bool = True,
+                 per_step_variance: bool = False):
         self.table = table
         self.mu = mu
         self.var = var
@@ -80,10 +83,11 @@ class GaussianState:
         self.steps = steps
         self.observations = observations
         self.resync = resync
+        self.per_step_variance = per_step_variance
 
     def _child(self, mu: Vec, var: Vec, placements: Tuple, cursor: int, steps: int):
         return GaussianState(self.table, mu, var, placements, cursor, steps,
-                             self.observations, self.resync)
+                             self.observations, self.resync, self.per_step_variance)
 
     def _tick(self, n: int = 1) -> int:
         steps = self.steps + n
@@ -104,6 +108,18 @@ class GaussianState:
         mu = (self.mu[0] + d_mu[0], self.mu[1] + d_mu[1], self.mu[2] + d_mu[2])
         var = (self.var[0] + d_var[0], self.var[1] + d_var[1], self.var[2] + d_var[2])
         return self._child(mu, var, self.placements, self.cursor, self._tick())
+
+    def moved(self, direction: str, n: int) -> "GaussianState":
+        '''SPL's shift_focus(direction, num_steps=n): the mean translates n steps; the
+        variance is added once, or n times when `per_step_variance`.'''
+        entry = self.table.get(direction)
+        if entry is None:
+            raise LatticeBudgetExceeded(f"no SRN entry for direction {direction!r}")
+        d_mu, d_var = entry
+        k = n if self.per_step_variance else 1
+        mu = (self.mu[0] + n * d_mu[0], self.mu[1] + n * d_mu[1], self.mu[2] + n * d_mu[2])
+        var = (self.var[0] + k * d_var[0], self.var[1] + k * d_var[1], self.var[2] + k * d_var[2])
+        return self._child(mu, var, self.placements, self.cursor, self._tick(n))
 
     def placed(self) -> "GaussianState":
         if len(self.placements) >= MAX_PLACEMENTS:
@@ -164,13 +180,14 @@ class GaussianState:
 
 
 def initial(table: Dict[str, Tuple[Vec, Vec]], observations: Sequence[Vec] = (),
-            resync: bool = True) -> GaussianState:
+            resync: bool = True, per_step_variance: bool = False) -> GaussianState:
     '''The empty state for one (demonstration, program) pair.
 
     The origin is the first placed block, matching `tasks.demo_centroids`, so the first
     placement is at (0,0,0) by construction and the comparison is translation-invariant.
     '''
-    return GaussianState(table, ZERO, RESET_VAR, (), 0, 0, tuple(observations), resync)
+    return GaussianState(table, ZERO, RESET_VAR, (), 0, 0, tuple(observations), resync,
+                         per_step_variance)
 
 
 def mahalanobis(observed: Vec, mu: Vec, var: Vec) -> float:
@@ -203,25 +220,24 @@ def log_pdf(observed: Vec, mu: Vec, var: Vec) -> float:
     return total
 
 
-def penalised_score(observed: Vec, mu: Vec, var: Vec, lam: float = 1.2) -> float:
-    '''SPL's `executor._penalised_score`: log p(x | focus) - lambda * tr(Sigma).
+# `penalised_score` / `penalised_ceiling` lived here: SPL's `_penalised_score` at
+# focus_score_penalty="trace", used by the `penalised_loglik` acceptance criterion. Both are
+# gone. SPL retired that formula (its default is now "reward"), and mirroring SPL's *reward* is
+# the wrong shape for a baseline anyway -- DreamCoder and LILO accept on a 0/1 check, so
+# borrowing the reward would hand the baseline part of what SPL is credited for.
 
-    Higher is better. `lam` is SPL's own `variance_penalty_weight`, 1.2 by default, and the
-    trace of a diagonal covariance is the sum of the variance vector.
+
+def run(fn, param, table, observations=(), resync: bool = True,
+        per_step_variance: bool = False):
+    '''Apply an evaluated IR term to its arguments under the Gaussian executor.
+
+    `param` is None for a closed program, a bare int for a 1-argument concept, or a tuple in
+    sketch order. A program of arity k is k nested closures, so each argument is applied in
+    turn.
     '''
-    return log_pdf(observed, mu, var) - lam * (var[0] + var[1] + var[2])
+    from baseline_spl.symbolic.ir import args
 
-
-def penalised_ceiling(var: Vec, lam: float = 1.2) -> float:
-    '''The best `penalised_score` achievable at this covariance -- the value when the
-    prediction lands exactly on the observation. Subtracting it turns an unbounded
-    log-density into a per-placement shortfall in nats, which is comparable across
-    placements whose variance differs by orders of magnitude.
-    '''
-    return penalised_score(ZERO, ZERO, var, lam)
-
-
-def run(fn, param: Optional[int], table, observations=(), resync: bool = True):
-    '''Apply an evaluated IR term to its argument under the Gaussian executor.'''
-    state = initial(table, observations, resync)
-    return (fn if param is None else fn(param))(state)
+    state = initial(table, observations, resync, per_step_variance)
+    for value in args(param):
+        fn = fn(value)
+    return fn(state)

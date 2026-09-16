@@ -43,6 +43,25 @@ from baseline_spl.common.serialize_visual import demo_frames
 DONE = "done()"
 ASSIGN_TEMPLATE = "assign_focus(object_id=<id of a block already placed>)"
 _ASSIGN_RE = re.compile(r"^\s*assign_focus\(\s*object_id\s*=\s*(\d+)\s*\)\s*$")
+# Multi-step shift, offered as a template like assign_focus: SPL picks num_steps against the
+# next demonstrated block (teacher forcing), which yields nothing at inference.
+_SHIFT_RE = re.compile(r"""^\s*shift_focus\(\s*["'](\w+)["']\s*,\s*num_steps\s*=\s*(\d+)\s*\)\s*$""")
+
+
+def _shift_template(max_shift_steps: int) -> str:
+    return f'shift_focus("DIRECTION", num_steps=<number of steps, 2 to {max_shift_steps}>)'
+
+
+def _parse_shift(action: str, max_shift_steps: int):
+    '''A well-formed multi-step shift within the bound -> its normalised string, else None.
+    num_steps=1 normalises to the listed single-step action.'''
+    match = _SHIFT_RE.match(action)
+    if not match:
+        return None
+    direction, n = match.group(1).upper(), int(match.group(2))
+    if f'"{direction}"' not in dsl_prompt.DIRECTIONS or not 1 <= n <= max_shift_steps:
+        return None
+    return f'shift_focus("{direction}")' if n == 1 else f'shift_focus("{direction}", num_steps={n})'
 
 # The same semantics the program baselines get from dsl_prompt.DSL_DOC, restated for a
 # flat action sequence: DSL_DOC documents calls "inside construct()" and refers to the
@@ -54,8 +73,9 @@ The environment keeps a single global FOCUS: a 3-D location where the next objec
 placed. You build a structure by moving the focus and dropping objects at it.
 
     shift_focus("DIRECTION")
-        Move the focus one step along DIRECTION, one of: {dsl_prompt.DIRECTIONS}.
-        Nothing is placed.
+    shift_focus("DIRECTION", num_steps=N)
+        Move the focus one step (or N steps, as a single action) along DIRECTION, one of:
+        {dsl_prompt.DIRECTIONS}. Nothing is placed.
 
     place_object_at_focus(objects.pop(0))
         Place the next unplaced object at the current focus. The focus does NOT move
@@ -94,7 +114,9 @@ Reply with a JSON object mapping each action to a score from 0 to 100, and nothi
 
 Score every listed action. For assign_focus you choose the argument yourself: write the
 concrete call, such as "assign_focus(object_id=3)", using the id of a block that has
-already been placed. Include it only when it is useful; omit it otherwise.'''
+already been placed. Include it only when it is useful; omit it otherwise.
+The same holds for a multi-step shift_focus when it is listed: write the concrete call,
+such as "shift_focus(\\"RIGHT\\", num_steps=2)", within the listed bound.'''
 
 ONESHOT_SYSTEM = '''You are directing a robot that builds block structures.
 
@@ -109,6 +131,9 @@ separate times.
 assign_focus(object_id=N) moves the focus onto a block placed earlier in this same plan.
 Use it when the next part of the structure starts from an earlier block rather than from
 where the focus has ended up; write the concrete call with the id.
+
+When a multi-step shift_focus is listed, write the concrete call, such as
+shift_focus("RIGHT", num_steps=2), within the listed bound.
 
 Reply with a JSON object holding the ordered action list, and nothing else:
 
@@ -215,10 +240,12 @@ class SayCanAgent:
         return "\n".join(lines)
 
     @staticmethod
-    def _parse_scores(reply: str, fixed: Sequence[str], placed: Sequence[int]):
-        '''JSON reply -> {action: score}. Keys must be a listed action or a well-formed
-        assign_focus onto an already-placed block; anything else is dropped rather than
-        executed. Returns {} when nothing usable came back.'''
+    def _parse_scores(reply: str, fixed: Sequence[str], placed: Sequence[int],
+                      max_shift_steps: int = 1):
+        '''JSON reply -> {action: score}. Keys must be a listed action, a well-formed
+        assign_focus onto an already-placed block, or a shift_focus with num_steps within
+        max_shift_steps; anything else is dropped rather than executed. Returns {} when
+        nothing usable came back.'''
         text = reply.strip()
         if "{" in text:                      # tolerate prose or fences around the object
             text = text[text.index("{"): text.rindex("}") + 1] if "}" in text else text
@@ -243,6 +270,10 @@ class SayCanAgent:
             if action in allowed:
                 scores[action] = value
                 continue
+            shift = _parse_shift(action, max_shift_steps)
+            if shift is not None:
+                scores[shift] = value
+                continue
             match = _ASSIGN_RE.match(action)
             if match and int(match.group(1)) in placed_ids:
                 # Normalised so the executed string is exactly what we validated.
@@ -250,9 +281,10 @@ class SayCanAgent:
         return scores
 
     @staticmethod
-    def _parse_plan(reply: str, fixed: Sequence[str]) -> List[str]:
-        '''JSON reply -> ordered action list. Entries that are neither a listed action nor
-        a well-formed assign_focus are dropped rather than executed.'''
+    def _parse_plan(reply: str, fixed: Sequence[str], max_shift_steps: int = 1) -> List[str]:
+        '''JSON reply -> ordered action list. Entries that are neither a listed action, a
+        well-formed assign_focus, nor a shift_focus with num_steps within max_shift_steps
+        are dropped rather than executed.'''
         text = reply.strip()
         start = min((text.index(c) for c in "[{" if c in text), default=-1)
         end = max((text.rindex(c) for c in "]}" if c in text), default=-1)
@@ -276,6 +308,10 @@ class SayCanAgent:
             if action in allowed:
                 plan.append(action)
                 continue
+            shift = _parse_shift(action, max_shift_steps)
+            if shift is not None:
+                plan.append(shift)
+                continue
             match = _ASSIGN_RE.match(action)
             if match:
                 # Any id is accepted here: which blocks are placed depends on the plan's
@@ -291,6 +327,8 @@ class SayCanAgent:
         names = list(demos[0].get("object_names") or []) if demos else []
         state = executor.query_current_state()
         fixed = list(action_space.get_primitives(state)) + [DONE]
+        max_shift = int(getattr(self.configs, "max_shift_focus_steps", 1))
+        templates = [ASSIGN_TEMPLATE] + ([_shift_template(max_shift)] if max_shift > 1 else [])
         preamble = f"{stats_block}\n{context}" if stats_block else context
         conversation = self.backend.start_conversation(f"{ONESHOT_SYSTEM}\n\n{ACTION_DOC}",
                                                        images=images)
@@ -298,10 +336,10 @@ class SayCanAgent:
             f"{preamble}\n\n# Instruction\n{instruction}\n\n"
             f"# Current state\n{self._state_text(state, [], names)}\n\n"
             "# Available actions\n"
-            + "\n".join(f"- {c}" for c in fixed + [ASSIGN_TEMPLATE]),
+            + "\n".join(f"- {c}" for c in fixed + templates),
             response_format="json", max_tokens=4000)
 
-        plan = self._parse_plan(reply, fixed)[: self.configs.max_steps]
+        plan = self._parse_plan(reply, fixed, max_shift)[: self.configs.max_steps]
         if not plan:
             log("[saycan] no usable plan in the reply")
             return [], "no_plan"
@@ -351,6 +389,8 @@ class SayCanAgent:
         conversation = self.backend.start_conversation(f"{SYSTEM}\n\n{ACTION_DOC}",
                                                        images=images)
         opening = f"{preamble}\n\n# Instruction\n{instruction}\n"
+        max_shift = int(getattr(self.configs, "max_shift_focus_steps", 1))
+        shift_template = [_shift_template(max_shift)] if max_shift > 1 else []
 
         for step in range(self.configs.max_steps):
             state = executor.query_current_state()
@@ -363,7 +403,7 @@ class SayCanAgent:
             # assign_focus is offered as a template: SPL's own assign actions are pruned
             # by distance to the next demonstrated block, which is teacher forcing and
             # yields nothing at inference, so the argument is the model's to choose.
-            listed = fixed + ([ASSIGN_TEMPLATE] if placed else [])
+            listed = fixed + shift_template + ([ASSIGN_TEMPLATE] if placed else [])
 
             # Full scene once; after that only what changed, since the conversation still
             # holds the scene and every action taken, and that history is billed each turn.
@@ -378,7 +418,7 @@ class SayCanAgent:
             scores = {}
             for _attempt in range(2):       # one retry, then give up rather than guess
                 reply = conversation.ask(turn, response_format="json", max_tokens=2000)
-                scores = self._parse_scores(reply, fixed, placed)
+                scores = self._parse_scores(reply, fixed, placed, max_shift)
                 if scores:
                     break
                 log(f"[saycan] step {step}: unusable score reply; re-asking")

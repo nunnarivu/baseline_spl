@@ -1,0 +1,201 @@
+{
+  "solved": [
+    "column_0002",
+    "column_0018",
+    "row_0000",
+    "row_0032",
+    "tower_0004",
+    "tower_0020"
+  ],
+  "approximate": [
+    "staircase_0005",
+    "staircase_0021"
+  ],
+  "unsolved": [],
+  "solved_by_llm": [],
+  "solved_by_enumeration": [
+    "column_0002",
+    "column_0018",
+    "row_0000",
+    "row_0032",
+    "tower_0004",
+    "tower_0020"
+  ],
+  "abstractions": [],
+  "documentation": {},
+  "evaluator": {
+    "evaluator": "srn_likelihood",
+    "accept_criterion": "mahalanobis",
+    "accept_threshold": 2.0,
+    "variance_penalty_weight": 1.2,
+    "saved_resync": true
+  },
+  "total_seconds": 94.33,
+  "iterations": [
+    {
+      "iteration": 0,
+      "solved": [
+        "column_0002",
+        "column_0018",
+        "row_0000",
+        "row_0032",
+        "tower_0004",
+        "tower_0020"
+      ],
+      "newly_solved": [
+        "row_0000",
+        "row_0032",
+        "tower_0004",
+        "tower_0020",
+        "column_0002",
+        "column_0018"
+      ],
+      "abstractions": [],
+      "programs_enumerated": 25802,
+      "seconds": 45.09,
+      "programs_per_second": 572.2,
+      "max_mdl_reached": 15.0,
+      "recognition_trained": false,
+      "solved_by_llm": [],
+      "seconds_by_stage": {
+        "proposal": 0.0,
+        "wake": 45.09,
+        "conditioning": 0.0,
+        "compress": 0.02,
+        "documentation": 0.0,
+        "reweight": 0.0,
+        "recognition": 0.01
+      }
+    },
+    {
+      "iteration": 1,
+      "solved": [
+        "column_0002",
+        "column_0018",
+        "row_0000",
+        "row_0032",
+        "tower_0004",
+        "tower_0020"
+      ],
+      "newly_solved": [],
+      "abstractions": [],
+      "programs_enumerated": 70185,
+      "seconds": 45.05,
+      "programs_per_second": 1557.8,
+      "max_mdl_reached": 18.0,
+      "recognition_trained": true,
+      "solved_by_llm": [],
+      "seconds_by_stage": {
+        "proposal": 0.0,
+        "wake": 45.05,
+        "conditioning": 0.04,
+        "compress": 0.06,
+        "documentation": 0.0,
+        "reweight": 0.0,
+        "recognition": 4.03
+      }
+    }
+  ],
+  "per_task": {
+    "row_0000": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.34,
+      "search_score": 0.3495,
+      "trace_distance": null,
+      "programs_tried": 6346,
+      "seconds": 17.32,
+      "program": "(lambda (loop 5 (lambda (lambda (shift RIGHT (place $0)))) $0))"
+    },
+    "row_0032": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.34,
+      "search_score": 0.3009,
+      "trace_distance": null,
+      "programs_tried": 6346,
+      "seconds": 17.32,
+      "program": "(lambda (loop 3 (lambda (lambda (shift RIGHT (place $0)))) $0))"
+    },
+    "tower_0004": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.34,
+      "search_score": 0.2829,
+      "trace_distance": null,
+      "programs_tried": 6346,
+      "seconds": 17.32,
+      "program": "(lambda (loop 3 (lambda (lambda (shift TOP (place $0)))) $0))"
+    },
+    "tower_0020": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.34,
+      "search_score": 0.6448,
+      "trace_distance": null,
+      "programs_tried": 6346,
+      "seconds": 17.32,
+      "program": "(lambda (loop 6 (lambda (lambda (shift TOP (place $0)))) $0))"
+    },
+    "column_0002": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.34,
+      "search_score": 0.6227,
+      "trace_distance": null,
+      "programs_tried": 6346,
+      "seconds": 17.32,
+      "program": "(lambda (loop 6 (lambda (lambda (shift FRONT (place $0)))) $0))"
+    },
+    "column_0018": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.34,
+      "search_score": 0.6148,
+      "trace_distance": null,
+      "programs_tried": 6346,
+      "seconds": 17.32,
+      "program": "(lambda (loop 5 (lambda (lambda (shift FRONT (place $0)))) $0))"
+    },
+    "staircase_0005": {
+      "status": "approximate",
+      "solved_by": null,
+      "mdl": 15.85,
+      "search_score": 5.4696,
+      "trace_distance": null,
+      "programs_tried": null,
+      "seconds": null,
+      "program": "(lambda (loop 6 (lambda (lambda (shift TOP (place $0)))) (loop 4 (lambda (lambda (shift RIGHT (place $0)))) $0)))"
+    },
+    "staircase_0021": {
+      "status": "approximate",
+      "solved_by": null,
+      "mdl": 8.88,
+      "search_score": 3.3694,
+      "trace_distance": null,
+      "programs_tried": null,
+      "seconds": null,
+      "program": "(lambda (loop 3 (lambda (lambda (shift TOP (place (shift RIGHT (place $0)))))) $0))"
+    }
+  },
+  "search_seconds": 94.33,
+  "demo_selection": {
+    "row": [
+      "0000",
+      "0032"
+    ],
+    "tower": [
+      "0004",
+      "0020"
+    ],
+    "column": [
+      "0002",
+      "0018"
+    ],
+    "staircase": [
+      "0005",
+      "0021"
+    ]
+  },
+  "task_granularity": "demo"
+}

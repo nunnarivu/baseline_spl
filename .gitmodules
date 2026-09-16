@@ -1,3 +1,6 @@
 [submodule "third_party/demo2code"]
 	path = third_party/demo2code
 	url = https://github.com/portal-cornell/demo2code.git
+[submodule "third_party/lilo"]
+	path = third_party/lilo
+	url = https://github.com/gabegrand/lilo.git

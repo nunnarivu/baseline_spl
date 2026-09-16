@@ -97,9 +97,10 @@ def render_stats_block(per_demo: List[Dict]) -> str:
         return ""
     header = (
         "# shift_focus delta statistics\n"
-        "Calling shift_focus(direction) moves the focus by the delta below, in metres.\n"
-        "Use these to decide which direction (or sequence of directions) accounts for the\n"
-        "movement between two placements. A movement may need more than one shift.\n"
+        "Calling shift_focus(direction) moves the focus by the delta below, in metres;\n"
+        "shift_focus(direction, num_steps=k) moves it by k times that delta in one call.\n"
+        "Use these to decide which direction (or sequence of directions) and how many steps\n"
+        "account for the movement between two placements. A movement may need more than one shift.\n"
     )
     if _agree(per_demo):
         return f"{header}\n{_table(per_demo[0]['stats'])}\n"

@@ -26,6 +26,7 @@ from typing import List
 import yaml
 
 from baseline_spl.common import codegen, dsl_prompt
+from baseline_spl.common.evaluator import ClassEvaluator
 from baseline_spl.common.harness import GeneratedConcept, log
 from baseline_spl.common.llm_backend import load_upstream_code_generator
 from baseline_spl.common.primitive_stats import build_stats_block
@@ -151,6 +152,9 @@ class Demo2CodeVLMAgent(Demo2CodeTextAgent):
         # No privileged 3-D state may reach the model in this condition.
         assert "grid cell" not in spec, "3-D grid coordinates leaked into the VLM spec"
 
+        # No distances in the report: they come from the 3-D state this condition never sees.
+        evaluator = (ClassEvaluator(shared, demos, sketch_infos, with_numbers=False)
+                     if self.configs.use_evaluator_feedback else None)
         code = codegen.generate_with_retries(
             self.backend,
             dsl_prompt.build_system_prompt(stats_block, require_signature=bool(sketch_infos),
@@ -159,6 +163,7 @@ class Demo2CodeVLMAgent(Demo2CodeTextAgent):
              f"# Task specification, summarized from the demonstration videos\n{spec}\n"),
             wanted_name=concept,
             max_retries=self.configs.max_code_retries,
+            evaluator=evaluator,
             log=log,
         )
         if code is None:
@@ -166,4 +171,6 @@ class Demo2CodeVLMAgent(Demo2CodeTextAgent):
 
         info = {"variant": "vlm", "num_demos_summarized": len(summaries),
                 "spec_chars": len(spec)}
+        if evaluator is not None:
+            info["evaluator"] = evaluator.record
         return self._result(code, concept, sketch_infos, shared, info)

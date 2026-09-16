@@ -27,7 +27,6 @@ from collections import Counter
 from typing import Dict, List, Optional, Sequence
 
 from baseline_spl.symbolic._dreamcoder import Grammar, Invented, Program
-from baseline_spl.symbolic.bridge import CONCEPT_REQUEST
 from baseline_spl.symbolic.lilo import prompts
 from baseline_spl.symbolic.search import SearchTask, score
 from baseline_spl.symbolic.stitch_bridge import eta_long
@@ -142,13 +141,9 @@ def extract_candidates(text: str) -> List[str]:
     programs in one reply. Upstream also passes `stop="\\n"` (`gpt_base.py:361`), which
     keeps a completion to a single line in the first place.
 
-    An earlier version of this function split on lines. That was silently destructive: a
-    model that pretty-prints its program across several lines had each line taken as a
-    separate "candidate", so whole programs were shredded into fragments. Measured on the
-    first exact-LILO run -- 72 "candidates", 68 rejected as `wrong_request_type` because
-    they were sub-expressions like `(shift TOP (place $0))` inferring to bare `tstate`,
-    while the model had in fact written well-formed programs. Nothing about that 0/72 was
-    a fact about LILO.
+    Do NOT split on lines: a model that pretty-prints across several lines would have each
+    line taken as a separate candidate, shredding whole programs into sub-expressions that
+    infer to bare `tstate` and are rejected as wrong-request-type.
 
     Returns a single-element list (or empty) so the caller's loop is unchanged.
     '''
@@ -362,8 +357,11 @@ class LLMProposer:
         except Exception:  # noqa: BLE001
             self.rejections[INFER] += 1
             return None
-        # 3. has the request type the task asks for
-        if inferred != CONCEPT_REQUEST:
+        # 3. has the request type THIS task asks for. A demo-level task is closed
+        # (`tstate -> tstate`); comparing against the concept-level request rejected every
+        # proposal on such a run, so B3-b's proposer contributed nothing at demo level.
+        expected = task.request
+        if inferred != expected:
             self.rejections[REQUEST] += 1
             return None
         # 4. no free variables
@@ -371,13 +369,13 @@ class LLMProposer:
             self.rejections[FREE_VARS] += 1
             return None
         # 5. normalises to eta-long form, which logLikelihood requires
-        normalised = eta_long(program)
+        normalised = eta_long(program, expected)
         if normalised is None:
             self.rejections[ETA_LONG] += 1
             return None
         # 6. the grammar can score it
         try:
-            prior = grammar.logLikelihood(CONCEPT_REQUEST, normalised)
+            prior = grammar.logLikelihood(expected, normalised)
         except Exception:  # noqa: BLE001
             self.rejections[LIKELIHOOD] += 1
             return None

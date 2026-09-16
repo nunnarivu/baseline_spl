@@ -17,9 +17,10 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from typing import Dict, List
 
+import numpy as np
 from tqdm import tqdm
 
 from baseline_spl.common.harness import BaselineHarness, log
@@ -33,8 +34,11 @@ class SayCanHarness(BaselineHarness):
         super().__init__(configs, agent)
         self._plans_path = os.path.join(configs.run_dir, PLAN_LIBRARY)
         # Keyed by concept -> list of {demo_id, instruction, actions, stop_reason}.
-        self._plans: Dict[str, List[dict]] = (
-            self._load_records(self._plans_path) if configs.resume else {})
+        # Read unconditionally, like the metric files and unlike the concept library: SayCan
+        # registers no class, so load_concept_checkpoint says nothing about whether these
+        # plans should be reused, and discarding them re-pays for every demo already solved.
+        # To start clean, delete plan_library.json or run under a new run_name.
+        self._plans: Dict[str, List[dict]] = self._load_records(self._plans_path)
         if self._plans:
             log(f"Loaded cached plans for {sorted(self._plans)}")
 
@@ -47,7 +51,14 @@ class SayCanHarness(BaselineHarness):
         meshes = demo["meshes"]
         self.spl.executor.register_state("inference", meshes[0], None, None, None, None, None)
         state = self.spl.executor.query_current_state()
-        state.set_focus(make_focus(mesh_centroid(meshes[1][0])))
+        # As in SPL's infer(): the block that moved most between keyframes 0 and 1 (the first
+        # one placed), unless INIT_FOCUS_INFERENCE is configured.
+        focus = self.configs.INIT_FOCUS_INFERENCE
+        if focus is None:
+            first = int(np.argmax([np.linalg.norm(mesh_centroid(a) - mesh_centroid(b))
+                                   for a, b in zip(meshes[0], meshes[1])]))
+            focus = make_focus(mesh_centroid(meshes[1][first]))
+        state.set_focus(focus)
         return state
 
     def _solve(self, demo, cached_plans, recursive):
@@ -179,30 +190,21 @@ class SayCanHarness(BaselineHarness):
         return metrics.get("plan_accuracy")
 
     def learn_all(self) -> None:
-        from SPL.dataloader.datasets import build_inductive_structure_dataloader
+        from SPL.dataloader.datasets import iter_concept_demos
 
         cfg = self.configs
         concepts = list(cfg.concepts_to_learn or cfg.concepts_space)
         log("Caching plans for: " + ", ".join(concepts))
 
-        loader = build_inductive_structure_dataloader(
-            cfg.dataset_name, cfg.train_dataset_dir, cfg.assets_dir,
-            camera_view="fixed_robot_diag_45", batch_size=1,
-            num_workers=getattr(cfg, "num_workers", 4), shuffle=False,
-            load_images=True, load_only=concepts)
-
-        by_concept = OrderedDict({c: [] for c in concepts})
-        for batch in tqdm(loader, desc="Loading demonstrations", total=len(loader)):
-            for data in batch:
-                if data["concept"] in by_concept:
-                    by_concept[data["concept"]].append(data)
-
-        for concept, demos in by_concept.items():
-            if not demos:
+        # One concept's demonstrations in memory at a time: the whole dataset does not fit.
+        for concept, wanted in iter_concept_demos(
+                cfg.dataset_name, cfg.train_dataset_dir, cfg.assets_dir,
+                camera_view=cfg.camera_view, concepts=concepts,
+                num_demos=cfg.num_demos_per_concept, load_images=True):
+            if not wanted:
                 log(f"No demonstrations found for <{concept}>; skipping.")
                 continue
-            n = min(len(demos), cfg.num_demos_per_concept)
-            wanted = demos[:n]
+            n = len(wanted)
             missing = self._missing_demos(concept, wanted)
             if not missing:
                 log(f"<{concept}> already has plans for all {n} demonstration(s); skipping.")
@@ -239,7 +241,7 @@ class SayCanHarness(BaselineHarness):
 
         loader = build_inductive_structure_dataloader(
             cfg.dataset_name, cfg.test_dataset_dir, cfg.assets_dir,
-            camera_view="fixed_robot_diag_45", batch_size=1,
+            camera_view=cfg.camera_view, batch_size=1,
             num_workers=getattr(cfg, "num_workers", 4), shuffle=False,
             load_images=self.agent.demo_modality == "images", load_only=concepts)
 

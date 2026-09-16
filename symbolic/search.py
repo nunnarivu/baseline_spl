@@ -88,17 +88,32 @@ class SearchTask:
     closed: bool = False
 
     @property
+    def arity(self) -> int:
+        '''How many integer arguments this task's programs take.
+
+        Zero when closed -- a demo-level program bakes the size in as a literal. Otherwise the
+        number of integers the sketch supplied, which is 1 for 69 of SPL's concepts, 2 for 12
+        and 3 for 2.
+        '''
+        from baseline_spl.symbolic.ir import args
+
+        if self.closed:
+            return 0
+        return len(args(self.examples[0][0])) if self.examples else 1
+
+    @property
     def request(self):
         '''The type enumeration must produce for this task.'''
-        from baseline_spl.symbolic.bridge import CONCEPT_REQUEST, DEMO_REQUEST
+        from baseline_spl.symbolic.bridge import request_for
 
-        return DEMO_REQUEST if self.closed else CONCEPT_REQUEST
+        return request_for(self.arity)
 
     def table_for(self, index: int) -> Optional[dict]:
         return self.srn_tables[index] if index < len(self.srn_tables) else None
 
     @property
-    def parameters(self) -> List[int]:
+    def parameters(self) -> List:
+        '''Each example's argument value: an int for a 1-argument concept, else a tuple.'''
         return [n for n, _ in self.examples]
 
 
@@ -186,11 +201,24 @@ class SearchStats:
         return self.programs_enumerated / self.seconds if self.seconds else 0.0
 
 
-def run_program(fn, param: int) -> Optional[List[Cell]]:
+def apply_args(fn, param):
+    '''Apply an evaluated program to its integer arguments, in sketch order.
+
+    A program of arity k is k nested single-argument closures, so a 2-argument concept is
+    `fn(a)(b)(state)`. `ir.args` normalises the bare int a 1-argument concept still uses.
+    '''
+    from baseline_spl.symbolic.ir import args
+
+    for value in args(param):
+        fn = fn(value)
+    return fn
+
+
+def run_program(fn, param) -> Optional[List[Cell]]:
     '''Apply an evaluated program to one parameter under the lattice executor.
     None if it cannot run. Kept for callers that want cells regardless of the evaluator.'''
     try:
-        return fn(param)(EMPTY).positions
+        return apply_args(fn, param)(EMPTY).positions
     except (LatticeBudgetExceeded, RecursionError, IndexError, ValueError, TypeError,
             ZeroDivisionError, KeyError, OverflowError):
         return None
@@ -237,25 +265,45 @@ def slices(lower: float, upper: float, n: int) -> List[Tuple[float, float]]:
 # inherited through fork, so re-parsing in the parent is exact and avoids pickling closures.
 # --------------------------------------------------------------------------------------- #
 
-def _enumerate_unit(args):
-    '''Enumerate one (grammar, tasks) unit over one MDL band. Returns plain data only.
+@dataclass
+class EnumerationJob:
+    '''One unit of wake-phase work, sent to a worker process.
 
-    A unit is a grammar plus the tasks that share it. With one global grammar there is a
-    single unit covering every task; with per-task grammars from the recognition model there
-    is one unit per task, and those run in parallel.
+    A unit is a grammar plus the tasks that share it: one unit covering every task when the
+    grammar is global, one unit per task when the recognition model gives each its own.
+
+    A dataclass rather than a tuple because this crosses a process boundary and is unpacked
+    far from where it is built. Two of these fields are a time in seconds and two are an
+    absolute timestamp; swapping `slice_seconds` and `hard_deadline` positionally would make
+    every unit expire immediately and report its tasks unsolved, having enumerated nothing --
+    a silent failure with no exception to catch. Names make that mistake impossible.
+
+    Must stay picklable: `pool.map` pickles its arguments regardless of the start method.
     '''
-    grammar, tasks, lower, upper, slice_seconds, hard_deadline, soft, evaluator, keep = args
+
+    grammar: object
+    tasks: List[SearchTask]
+    lower: float                 # MDL band, exclusive
+    upper: float                 # MDL band, inclusive
+    slice_seconds: float         # this unit's share of the clock, from when IT starts
+    hard_deadline: float         # absolute; the phase ends here whatever the slice says
+    soft_frontier: bool          # keep near-misses for concepts that are not solved
+    evaluator: object
+    keep: int                    # accepted programs to carry back per task
+
+
+def _enumerate_unit(job: "EnumerationJob"):
+    '''Enumerate one job over its MDL band. Returns plain data only.'''
+    grammar, tasks = job.grammar, job.tasks
+    lower, upper, soft, keep = job.lower, job.upper, job.soft_frontier, job.keep
     from dreamcoder.type import Context
 
-    # Each unit gets its own share of the clock, measured from when IT starts, capped by the
-    # phase's hard deadline. Previously every unit carried the same ABSOLUTE deadline, which
-    # is correct only while units <= workers: beyond that the first batch consumed the entire
-    # budget and every later unit broke out immediately, reporting "unsolved" without having
-    # enumerated a single program. Invisible at 16 concepts on 16 workers; at 100 concepts it
-    # would silently starve most of the task set.
-    deadline = min(time.time() + slice_seconds, hard_deadline)
+    # Each unit's clock starts when the unit does, capped by the phase deadline. A shared
+    # ABSOLUTE deadline is correct only while units <= workers; beyond that the first wave
+    # consumes the whole budget and every later unit reports unsolved without enumerating.
+    deadline = min(time.time() + job.slice_seconds, job.hard_deadline)
 
-    evaluator = evaluator or DEFAULT_EVALUATOR
+    evaluator = job.evaluator or DEFAULT_EVALUATOR
     # Bound on how many accepted programs to carry back per task. The parent keeps only
     # `maximum_frontier` of them anyway (`Solution.add_exact` sorts by prior and truncates),
     # so returning more is pure waste -- and at a long budget it is ruinous waste. Every
@@ -307,18 +355,21 @@ def _enumerate_unit(args):
 # --------------------------------------------------------------------------------------- #
 
 def _units(grammar, tasks: Sequence[SearchTask]):
-    '''Group tasks by the grammar they will be searched under.
+    '''Group tasks by the grammar AND the request type they will be searched under.
 
-    A single Grammar gives one unit covering every task (no redundant re-enumeration). A
-    {task name: Grammar} map -- what the recognition model produces -- gives one unit per
-    distinct grammar, and those are what parallelise.
+    A single Grammar gives one unit per request type (no redundant re-enumeration within a
+    type). A {task name: Grammar} map -- what the recognition model produces -- gives one unit
+    per distinct (grammar, request) pair, and those are what parallelise.
+
+    The request has to be part of the key. Enumeration produces programs of ONE type, so a unit
+    holding both `row` (`tint -> tstate -> tstate`) and `rectangle`
+    (`tint -> tint -> tstate -> tstate`) would search a type that cannot solve one of them --
+    silently, since a task that is never solved looks exactly like a task that is too hard.
     '''
-    if not isinstance(grammar, dict):
-        return [(grammar, list(tasks))]
-    grouped: Dict[int, Tuple[object, List[SearchTask]]] = {}
+    grouped: Dict[Tuple, Tuple[object, List[SearchTask]]] = {}
     for task in tasks:
-        g = grammar[task.name]
-        grouped.setdefault(id(g), (g, []))[1].append(task)
+        g = grammar[task.name] if isinstance(grammar, dict) else grammar
+        grouped.setdefault((id(g), str(task.request)), (g, []))[1].append(task)
     return list(grouped.values())
 
 
@@ -358,8 +409,10 @@ def wake(grammar, tasks: Sequence[SearchTask], *, timeout: float = 60.0,
             waves = max(1, math.ceil(len(units) / max(1, workers)))
             remaining = max(0.0, deadline - time.time())
             slice_seconds = remaining / waves
-            work = [(g, unit_tasks, lower, budget, slice_seconds, deadline, soft_frontier,
-                     evaluator, maximum_frontier)
+            work = [EnumerationJob(grammar=g, tasks=unit_tasks, lower=lower, upper=budget,
+                                   slice_seconds=slice_seconds, hard_deadline=deadline,
+                                   soft_frontier=soft_frontier, evaluator=evaluator,
+                                   keep=maximum_frontier)
                     for g, unit_tasks in units]
 
             if pool is None:
@@ -400,8 +453,14 @@ def wake(grammar, tasks: Sequence[SearchTask], *, timeout: float = 60.0,
     for solution in stats.per_task.values():
         if solution.term is None and solution.program is not None:
             try:
-                solution.term = to_term(solution.program, concept_level=not _closed_run(tasks))
-            except Exception:  # noqa: BLE001
+                solution.term = to_term(solution.program,
+                                        concept_level=not _closed_run(tasks))
+            except Exception as exc:  # noqa: BLE001
+                # The harness reports this as `search_untranslatable`, but only the reason
+                # explains why a solved concept produced no class.
+                if log:
+                    log(f"  {solution.task}: solved, but the program could not be read back "
+                        f"as a term ({type(exc).__name__}: {exc})")
                 solution.term = None
     return stats
 
@@ -411,10 +470,14 @@ def _closed_run(tasks) -> bool:
     return bool(tasks) and bool(getattr(list(tasks)[0], "closed", False))
 
 
-def _parse(source: str) -> Optional[Program]:
+def _parse(source: str, log=None) -> Optional[Program]:
+    '''Re-parse a program a worker found. None means the solution is lost, so say so.'''
     try:
         return Program.parse(source)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log(f"  a worker's solution did not re-parse in the parent "
+                f"({type(exc).__name__}: {exc}): {source[:80]}")
         return None
 
 

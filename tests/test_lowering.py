@@ -18,10 +18,10 @@ Run: python -m baseline_spl.tests.test_lowering
 
 from __future__ import annotations
 
-from SPL.config.spl_config import ALL_CONCEPTS
+from SPL.config.spl_config import ORIGINAL_CONCEPTS
 from SPL.utils.metrics import check_program_equivalence
 from baseline_spl.common.codegen import class_signature, validate
-from baseline_spl.symbolic.ir import positions
+from baseline_spl.symbolic.ir import BinOp, Const, Loop, Move, Param, Place, Seq, positions
 from baseline_spl.symbolic.lower import lower, lowered_positions, saved_is_exact
 from baseline_spl.symbolic.oracles import ORACLES
 
@@ -85,20 +85,34 @@ def check_concept(concept: str):
 # ----------------------------------------------------------------------------------- #
 
 def test_lowered_oracles_are_equivalent_to_ground_truth():
-    problems = {c: why for c in sorted(ALL_CONCEPTS) if (why := check_concept(c))}
+    problems = {c: why for c in sorted(ORIGINAL_CONCEPTS) if (why := check_concept(c))}
     assert not problems, "\n".join(f"{c}: {w}" for c, w in problems.items())
 
 
 def test_emitted_class_is_valid_python_for_every_concept():
-    for concept in ALL_CONCEPTS:
+    for concept in ORIGINAL_CONCEPTS:
         validate(lower(ORACLES[concept], concept, param_name(concept)))
+
+
+def test_move_lowers_to_one_multi_step_shift():
+    '''`move` lowers to a single shift_focus(d, num_steps=n) and places exactly where the term
+    does -- including a distance that is zero for some parameters, which must be skipped.'''
+    term = Seq(Loop(Param(), Seq(Place(), Move("right", Const(2)))),
+               Move("top", BinOp("-", Param(), Const(1))), Place())
+    code = lower(term, "gap_row", "length")
+    validate(code)
+    assert 'shift_focus("RIGHT", num_steps=2)' in code
+    assert "if length - 1 > 0:" in code
+    assert saved_is_exact(term) == (True, None)
+    for n in range(MIN_PARAM, 6):
+        assert lowered_positions(term, "gap_row", "length", n) == positions(term, n)
 
 
 def main() -> int:
     print(f"{'concept':<28} {'verdict':<10} notes")
     print("-" * 72)
     failures = []
-    for concept in sorted(ALL_CONCEPTS):
+    for concept in sorted(ORIGINAL_CONCEPTS):
         why = check_concept(concept)
         if why:
             failures.append((concept, why))
@@ -111,7 +125,7 @@ def main() -> int:
         for concept, why in failures:
             print(f"  {concept}: {why}")
         return 1
-    print(f"\nall {len(ALL_CONCEPTS)} lowered oracles proven equivalent to ground truth")
+    print(f"\nall {len(ORIGINAL_CONCEPTS)} lowered oracles proven equivalent to ground truth")
     return 0
 
 

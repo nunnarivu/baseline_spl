@@ -25,16 +25,15 @@ from __future__ import annotations
 import textwrap
 from typing import List, Optional, Tuple
 
-from baseline_spl.symbolic.ir import (Loop, Move, Place, Saved, Seq, Shift, Term,
+from baseline_spl.symbolic.ir import (Const, Loop, Move, Place, Saved, Seq, Shift, Term,
                                       evaluate, simplify)
 from baseline_spl.symbolic.lattice import EMPTY
 
 INDENT = "    "
 
 CLASS_TEMPLATE = '''class {name}:
-    def __init__(self, {param}: int, objects: list):
-        self.{param} = {param}
-        self.objects = list(objects) if objects is not None else []
+    def __init__(self, {signature}objects: list):
+{assignments}        self.objects = list(objects) if objects is not None else []
         self.constructed = False
 
         # Book keeping
@@ -47,13 +46,11 @@ CLASS_TEMPLATE = '''class {name}:
             raise Exception("Construct method has already been called for this instance.")
         self.constructed = True
 
-        {param} = self.{param}
-{body}
+{locals}{body}
 
     @staticmethod
     def argument_sampler():
-        for _n in range(1, 1001):
-            yield (_n, None)
+{sampler}
 
     @property
     def blocks(self):
@@ -98,16 +95,17 @@ def _emit(term: Term, param: str, loops: List[str], saved_depth: int) -> List[st
                 f"self._plan.append('shift_focus(\"{d}\")')"]
 
     if isinstance(term, Move):
-        # SPL's executor has no multi-cell move, so `move` lowers to a loop of unit shifts.
-        # The emitted plan is byte-identical to the equivalent chain of `shift`s: `move` is a
-        # search-space convenience that lets one application cover a k-cell step, exactly as
-        # DreamCoder's `left`/`right` do, not a new action in the robot's vocabulary.
+        # One shift_focus(d, num_steps=n) call, so the live executor scores `move` exactly as
+        # SPL scores its own multi-step shifts. A count <= 0 is a no-op in the IR (as `range`
+        # would be) but raises in SPL, hence the guard unless the count is a positive literal.
         d = term.direction.upper()
-        count = simplify(term.distance).render(param, loops)
-        var = _loop_name(len(loops))
-        return [f"for {var} in range({count}):",
-                INDENT + f'shift_focus("{d}")',
-                INDENT + f"self._plan.append('shift_focus(\"{d}\")')"]
+        distance = simplify(term.distance)
+        count = distance.render(param, loops)
+        call = [f'shift_focus("{d}", num_steps={count})',
+                f"self._plan.append(f'shift_focus(\"{d}\", num_steps={{{count}}})')"]
+        if isinstance(distance, Const) and distance.value > 0:
+            return call
+        return [f"if {count} > 0:"] + [INDENT + line for line in call]
 
     if isinstance(term, Seq):
         lines: List[str] = []
@@ -137,19 +135,53 @@ def _emit(term: Term, param: str, loops: List[str], saved_depth: int) -> List[st
 
 
 def lower(term: Term, name: str, param: str = "length") -> str:
-    '''IR term -> concept class source.'''
+    '''IR term -> concept class source. `param` is one name, or several in sketch order.'''
+    from baseline_spl.symbolic.ir import args as _args
+
+    names = [str(n) for n in _args(param)]
     body = _emit(term, param, [], 0)
     indented = textwrap.indent("\n".join(body), INDENT * 2)
-    return CLASS_TEMPLATE.format(name=name, param=param, body=indented)
+
+    signature = "".join(f"{n}: int, " for n in names)
+    assignments = "".join(f"{INDENT * 2}self.{n} = {n}\n" for n in names)
+    locals_ = "".join(f"{INDENT * 2}{n} = self.{n}\n" for n in names)
+
+    # `argument_sampler` yields one tuple per call: every integer argument, then None for the
+    # object list. Nested ranges for k > 1, mirroring the shape SPL's own learned `rectangle`
+    # emits, so a multi-argument class is swept the same way a hand-written one is.
+    if not names:
+        sampler = f"{INDENT * 2}yield (None,)\n"
+    else:
+        sampler = ""
+        for depth, n in enumerate(names):
+            sampler += f"{INDENT * (2 + depth)}for _{n} in range(1, {1001 if len(names) == 1 else 21}):\n"
+        values = ", ".join(f"_{n}" for n in names)
+        sampler += f"{INDENT * (2 + len(names))}yield ({values}, None)\n"
+
+    return CLASS_TEMPLATE.format(name=name, signature=signature, assignments=assignments,
+                                 locals=locals_, body=indented, sampler=sampler.rstrip("\n"))
 
 
-def saved_is_exact(term: Term, params=range(1, 9)) -> Tuple[bool, Optional[str]]:
+def saved_is_exact(term: Term, params=None, arity: int = 1) -> Tuple[bool, Optional[str]]:
     '''Is every `Saved` in this term restorable via a placed block?
 
     Checks by execution rather than by assumption: for each parameter value, every Saved body
     must place at least one block, and its first placement must land on the cell the focus
     held when the body started. Returns (True, None) or (False, reason).
+
+    `params` defaults to 1..8 for one argument, and to the same range on every axis for more --
+    a sweep, because a Saved body can be exact at (3, 3) and empty at (3, 1).
     '''
+    if params is None:
+        if arity <= 1:
+            params = range(1, 9)
+        else:
+            import itertools
+
+            # 1..5 per axis keeps a 3-argument sweep at 125 rather than 512 evaluations; the
+            # failure this looks for is a Saved body that places nothing, which shows at small
+            # values if it shows at all.
+            params = list(itertools.product(*[range(1, 6)] * arity))
     def check(t: Term, state, param, loops):
         '''Evaluate t from `state`, verifying Saved nodes as we go. Returns the new state.'''
         if isinstance(t, Seq):
@@ -187,14 +219,24 @@ class _Inexact(Exception):
     pass
 
 
-def lowered_positions(term: Term, name: str, param_name: str, n: int) -> Optional[list]:
+def lowered_positions(term: Term, name: str, param_name, n) -> Optional[list]:
     '''Round-trip helper: lower the term, run the class on the ideal executor, return its
-    placement cells. Mirrors exactly what check_program_equivalence does.'''
+    placement cells. Mirrors exactly what check_program_equivalence does.
+
+    `param_name` and `n` are one name/value, or several in sketch order.'''
     from SPL.utils.metrics import run_predicted_program
 
+    from baseline_spl.symbolic.ir import args as _args
+
+    names = [str(x) for x in _args(param_name)]
+    values = _args(n)
     code = lower(term, name, param_name)
-    definitions = {name: {"arguments": {param_name: int, "objects": list}, "code": code}}
-    init = f"{name}_1 = {name}({param_name}={n}, objects=objects)\n{name}_1.construct()"
+    attributes = {a: int for a in names}
+    attributes["objects"] = list
+    definitions = {name: {"arguments": attributes, "code": code}}
+    bound = ", ".join(f"{a}={v}" for a, v in zip(names, values))
+    init = (f"{name}_1 = {name}({bound + ', ' if bound else ''}objects=objects)\n"
+            f"{name}_1.construct()")
     pool = len(evaluate(term, n).positions) + 8
     result = run_predicted_program(definitions, init, pool)
     return None if result is None else result["positions"]

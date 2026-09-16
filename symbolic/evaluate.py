@@ -11,9 +11,9 @@ a step SPL never takes, and therefore an advantage B3 was being handed rather th
 This module provides three evaluators behind one interface, so the choice is a config knob
 and a reportable comparison rather than a decision baked into the search:
 
-    exact           integer cells must match       (observation_mode='lattice')
-    tolerance       every placement within eps m   (observation_mode='continuous')
-    srn_likelihood  SPL's own probabilistic score  (observation_mode='continuous')
+    exact        integer cells must match            (observation_mode='lattice')
+    distance     every placement within eps metres   (observation_mode='continuous')
+    mahalanobis  every placement within tau sigma    (observation_mode='continuous')
 
 The interface
 -------------
@@ -31,13 +31,19 @@ a prefix. They return `miss_value` -- a finite sentinel far above any sane thres
 a program can never be accepted but still orders sensibly against other wrong-length programs
 when nothing better was found.
 
-Calibration
------------
-The two `srn_likelihood` criteria are deliberately calibrated to each other. For a Gaussian
-the log-density falls by exactly d**2/2 at Mahalanobis distance d, so `accept_margin = 4.5`
-nats *is* `accept_tau = 3.0`. Choosing between them therefore compares how placements are
-aggregated -- worst-case versus mean, and whether SPL's -lambda*tr(Sigma) variance penalty
-participates -- rather than comparing two arbitrary scales.
+Acceptance is 0/1, and never SPL's reward
+-----------------------------------------
+DreamCoder and LILO accept a program when it reproduces the task, full stop. Borrowing SPL's
+graded reward would hand the baseline part of what SPL is being credited for, so both
+continuous evaluators are threshold tests on a single badness number.
+
+`distance` uses the SAME bar as the LLM baselines: `common/evaluator.py` accepts a class when
+every block is within `sketch_val_state_error_threshold`, so this compares the worst placement
+against that same value. A mean or RMSE would be looser -- one bad block averages away -- and
+would put an asterisk on a results table the baselines share.
+
+A third criterion, `penalised_loglik`, was removed: it mirrored SPL's `_penalised_score` at
+`focus_score_penalty="trace"`, a formula SPL has since retired in favour of `"reward"`.
 '''
 
 from __future__ import annotations
@@ -49,14 +55,17 @@ from baseline_spl.symbolic import gaussian
 from baseline_spl.symbolic.lattice import EMPTY, LatticeBudgetExceeded
 
 # Exceptions an enumerated program can raise that mean "this program does not solve the
-# task", never "the run is broken".
+# task", never "the run is broken". These guards fire millions of times a second inside the
+# wake phase and are deliberately silent: a failed candidate is the normal case, not a
+# diagnostic. Handlers that hide a real problem -- a lost solution, a rejected library form --
+# do log, in search.py and driver.py.
 _RUN_ERRORS = (LatticeBudgetExceeded, RecursionError, IndexError, ValueError, TypeError,
                ZeroDivisionError, KeyError, OverflowError, AttributeError)
 
 VALID_COMBINATIONS = {
     ("lattice", "exact"),
-    ("continuous", "tolerance"),
-    ("continuous", "srn_likelihood"),
+    ("continuous", "distance"),
+    ("continuous", "mahalanobis"),
 }
 
 
@@ -161,25 +170,46 @@ class ExactEvaluator(Evaluator):
         # A closed program IS the state transformer; a parameterised one must be applied to
         # the size first. Getting this wrong does not crash -- it raises inside the scorer's
         # own guard and silently reports "this program does not run".
-        produced = (fn(EMPTY) if task.closed else fn(param)(EMPTY)).positions
+        from baseline_spl.symbolic.search import apply_args
+
+        produced = (fn(EMPTY) if task.closed else apply_args(fn, param)(EMPTY)).positions
         return trace_distance(produced, target)
 
 
-class ToleranceEvaluator(Evaluator):
-    '''Continuous observations, deterministic execution, a fixed radius in metres.
+def default_distance_threshold() -> float:
+    '''SPL's `sketch_val_state_error_threshold`, the tolerance the LLM baselines already use.'''
+    from SPL.config.spl_config import SPLConfig
 
-    Uses the SRN means and ignores its variances, so the executor is the Gaussian one with
-    the uncertainty channel unused. Simple to explain and independent of any threshold
-    calibration, but it charges a placement reached after ten compounding shifts exactly as
-    strictly as the first -- which is the asymmetry the probabilistic evaluator exists to
-    remove. Whether that matters here is the empirical question the two knobs answer.
+    return float(getattr(SPLConfig, "sketch_val_state_error_threshold", 0.06))
+
+
+class DistanceEvaluator(Evaluator):
+    '''Continuous observations: every placement must land within a fixed radius, in metres.
+
+    **The same bar the LLM baselines apply.** `common/evaluator.py` accepts a generated class
+    when EVERY block is within `sketch_val_state_error_threshold` of the demo's last keyframe
+    (`far = [... if d > self.tolerance]`), so this uses the worst per-placement distance and the
+    same threshold. An RMSE or mean would be a looser bar -- one badly-placed block averages
+    away -- and would judge the symbolic baselines more leniently than CaP/Demo2Code while their
+    numbers sit in one table.
+
+    Uses the SRN means and ignores its variances, so the executor is the Gaussian one with the
+    uncertainty channel unused. It charges a placement reached after ten compounding shifts
+    exactly as strictly as the first; whether that matters is what the mahalanobis knob answers.
     '''
 
-    name = "tolerance"
+    name = "distance"
 
-    def __init__(self, epsilon: float = 0.03, resync: bool = True):
-        self.threshold = float(epsilon)
+    def __init__(self, epsilon: Optional[float] = None, resync: bool = True,
+                 per_step_variance: bool = False):
+        self.threshold = default_distance_threshold() if epsilon is None else float(epsilon)
         self.resync = resync
+        self.per_step_variance = per_step_variance
+
+    def accepts(self, value: Optional[float]) -> bool:
+        # Inclusive: "within 0.06" has to include 0.06. The base class is a strict `<`, which
+        # would reject a placement exactly on the tolerance the LLM baselines accept.
+        return value is not None and value <= self.threshold
 
     def describe(self) -> dict:
         return {"evaluator": self.name, "accept_threshold": self.threshold,
@@ -189,7 +219,8 @@ class ToleranceEvaluator(Evaluator):
         table = task.table_for(index)
         if table is None:
             return None
-        state = gaussian.run(fn, None if task.closed else param, table, target, self.resync)
+        state = gaussian.run(fn, None if task.closed else param, table, target, self.resync,
+                             self.per_step_variance)
         produced = state.positions
         if len(produced) != len(target):
             return self.miss_value + abs(len(produced) - len(target))
@@ -200,60 +231,48 @@ class ToleranceEvaluator(Evaluator):
         return worst
 
 
-class LikelihoodEvaluator(Evaluator):
-    '''Continuous observations scored with SPL's own probabilistic focus.
+class MahalanobisEvaluator(Evaluator):
+    '''Continuous observations scored against SPL's probabilistic focus, in sigma.
 
     The executor is `gaussian.GaussianState`, which mirrors `executor._predict_focus`
     (mu += mu_d, var += var_d) and `assign_focus` (mean snaps to the placed block, variance
-    resets). Two acceptance criteria, selected by `criterion`:
+    resets). Acceptance is "every placement within tau sigma": it needs no per-demo
+    calibration and degrades naturally as the covariance compounds, unlike `distance`, which
+    charges the tenth placement as strictly as the first.
 
-      'mahalanobis'       worst placement, in sigma.  Interpretable as "within tau sigma
-                          everywhere", needs no per-demo calibration, and degrades naturally
-                          as the covariance compounds.
-      'penalised_loglik'  SPL's `_penalised_score` verbatim, including the
-                          -lambda*tr(Sigma) variance penalty, expressed as a mean shortfall
-                          in nats below the best score achievable at that covariance.
-                          Subtracting the ceiling is what makes placements with very
-                          different variances comparable.
+    A second criterion, `penalised_loglik`, used to live here. It reproduced SPL's
+    `_penalised_score` at `focus_score_penalty="trace"` -- a reward formula SPL has since
+    retired (`spl_config.py` now defaults to `"reward"`). Mirroring SPL's *reward* is also the
+    wrong shape for a baseline: DreamCoder and LILO accept a program on a 0/1 check, and
+    borrowing SPL's reward would hand the baseline part of what SPL is being credited for.
     '''
 
-    name = "srn_likelihood"
+    name = "mahalanobis"
 
-    def __init__(self, criterion: str = "mahalanobis", tau: float = 2.0,
-                 margin: float = 2.0, lam: float = 1.2, resync: bool = True):
-        if criterion not in ("mahalanobis", "penalised_loglik"):
-            raise ValueError(f"unknown accept_criterion {criterion!r}")
-        self.criterion = criterion
-        self.lam = float(lam)
+    def __init__(self, tau: float = 2.0, resync: bool = True,
+                 per_step_variance: bool = False):
+        self.threshold = float(tau)
         self.resync = resync
-        self.threshold = float(tau) if criterion == "mahalanobis" else float(margin)
+        self.per_step_variance = per_step_variance
 
     def describe(self) -> dict:
-        return {"evaluator": self.name, "accept_criterion": self.criterion,
-                "accept_threshold": self.threshold,
-                "variance_penalty_weight": self.lam, "saved_resync": self.resync}
+        return {"evaluator": self.name, "accept_threshold": self.threshold,
+                "saved_resync": self.resync}
 
     def _example_statistic(self, fn, param, target, task, index) -> Optional[float]:
         table = task.table_for(index)
         if table is None:
             return None
-        state = gaussian.run(fn, None if task.closed else param, table, target, self.resync)
+        state = gaussian.run(fn, None if task.closed else param, table, target, self.resync,
+                             self.per_step_variance)
         placements = state.gaussians
         if len(placements) != len(target):
             return self.miss_value + abs(len(placements) - len(target))
 
-        if self.criterion == "mahalanobis":
-            worst = 0.0
-            for (mu, var), obs in zip(placements, target):
-                worst = max(worst, gaussian.mahalanobis(obs, mu, var))
-            return worst
-
-        total = 0.0
+        worst = 0.0
         for (mu, var), obs in zip(placements, target):
-            shortfall = (gaussian.penalised_ceiling(var, self.lam)
-                         - gaussian.penalised_score(obs, mu, var, self.lam))
-            total += max(0.0, shortfall)
-        return total / max(1, len(placements))
+            worst = max(worst, gaussian.mahalanobis(obs, mu, var))
+        return worst
 
 
 # --------------------------------------------------------------------------------------- #
@@ -267,11 +286,11 @@ def build(configs) -> Evaluator:
     if name == "exact":
         return ExactEvaluator()
     resync = getattr(configs, "saved_resync", True)
-    if name == "tolerance":
-        return ToleranceEvaluator(getattr(configs, "accept_epsilon", 0.03), resync)
-    return LikelihoodEvaluator(
-        criterion=getattr(configs, "accept_criterion", "mahalanobis"),
-        tau=getattr(configs, "accept_tau", 3.0),
-        margin=getattr(configs, "accept_margin", 4.5),
-        lam=getattr(configs, "variance_penalty_weight", 1.2),
-        resync=resync)
+    # Inherited from SPLConfig, so `move` is scored exactly as SPL's shift_focus(d, num_steps=n).
+    per_step_variance = getattr(configs, "accumulate_shift_variance_per_step", False)
+    if name == "distance":
+        # None means "SPL's own tolerance", so the bar tracks SPL rather than a copy of it.
+        return DistanceEvaluator(getattr(configs, "accept_epsilon", None), resync,
+                                 per_step_variance)
+    return MahalanobisEvaluator(tau=getattr(configs, "accept_tau", 3.0),
+                                resync=resync, per_step_variance=per_step_variance)

@@ -159,18 +159,55 @@ def demo_centroids(demo: dict) -> List[tuple]:
     return [tuple(float(v) for v in delta) for delta in demo_deltas(demo)]
 
 
-def _parameter(sketch_info: dict) -> Tuple[str, int]:
-    '''(name, value) of the single integer argument the sketch read off the instruction.'''
+class Inexpressible(ValueError):
+    '''The sketch has an argument the search cannot represent, so the concept is out of scope.
+
+    Only `wall` does this today: it takes another CONCEPT as an argument, which the grammar
+    has no type for. Recorded rather than raised past the caller, so one such concept does not
+    abort a run over the other 98.
+    '''
+
+
+def _as_int(value):
+    '''The integer a sketch argument denotes, or None if it does not denote one.'''
+    if isinstance(value, bool):          # bools are ints in Python; a flag is not a size
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _parameter(sketch_info: dict) -> Tuple[Tuple[str, ...], Tuple[int, ...]]:
+    '''(names, values) of EVERY integer argument, in sketch order.
+
+    Sketch order is the order SPL's `check_program_equivalence` pairs integers by, so it is the
+    order a recovered class must use for its arguments to mean the same thing.
+
+    69 of the 99 concepts have exactly one integer, 12 have two, 2 have three and 15 have none.
+    Returning tuples rather than a bare `(name, value)` is what lets the other 30 be searched at
+    all; `ir.args` keeps the 1-argument case reading as it always did.
+
+    A non-integer, non-list argument makes the concept `Inexpressible` -- `wall` takes a
+    concept. Zero integer arguments is NOT an error: a fixed-size concept is a closed program,
+    which is exactly what `request_for(0)` describes.
+    '''
     arguments = (sketch_info or {}).get("arguments") or {}
+    names: List[str] = []
+    values: List[int] = []
     for name, spec in arguments.items():
         value = spec.get("value") if isinstance(spec, dict) else spec
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, int):
-            return name, int(value)
-        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-            return name, int(value.strip())
-    raise ValueError(f"no integer parameter in sketch {sketch_info!r}")
+        if name == "objects" or isinstance(value, (list, tuple)):
+            continue                     # the object list, not a size
+        as_int = _as_int(value)
+        if as_int is None:
+            raise Inexpressible(
+                f"argument {name!r} = {value!r} is not an integer; the grammar has no type "
+                f"for it")
+        names.append(name)
+        values.append(as_int)
+    return tuple(names), tuple(values)
 
 
 def select_demos(demos: Sequence[dict], sketch_infos: Sequence[dict], limit: int,
@@ -194,12 +231,14 @@ def select_demos(demos: Sequence[dict], sketch_infos: Sequence[dict], limit: int
     seen: set = set()
     for i, info in enumerate(sketch_infos):
         try:
-            _, value = _parameter(info)
+            _, values = _parameter(info)
         except ValueError:
             continue
-        if value not in seen:
+        # The whole argument tuple, so `rectangle(5,3)` and `rectangle(5,4)` count as distinct
+        # even though their first argument agrees.
+        if values not in seen:
             chosen.append(i)
-            seen.add(value)
+            seen.add(values)
         if len(chosen) == limit:
             return chosen
     # Not enough distinct values: top up in order so we still return `limit` demos.
@@ -251,22 +290,27 @@ def concept_task(concept: str, demos: Sequence[dict], sketch_infos: Sequence[dic
     if pitch is None:
         pitch = estimate_pitch(list(demos))
 
-    examples: List[Tuple[int, List]] = []
+    examples: List[Tuple[object, List]] = []
     names: set = set()
     ids: List[str] = []
     for demo, info in zip(demos, sketch_infos):
-        name, value = _parameter(info)
-        names.add(name)
-        examples.append((value, _target(demo, pitch, observation_mode)))
+        arg_names, values = _parameter(info)
+        names.add(arg_names)
+        # One integer stays a bare int, so the 69 single-argument concepts and every existing
+        # oracle and test read exactly as before; `ir.args` normalises either shape.
+        examples.append((values[0] if len(values) == 1 else values,
+                         _target(demo, pitch, observation_mode)))
         ids.append(str(demo.get("demo_id")))
 
     if len(names) > 1:
         # The sketch disagreed across demos; `SharedSketch.corrected` should have settled
         # this upstream, so surface it rather than silently picking one.
-        raise ValueError(f"{concept}: demos disagree on the parameter name: {sorted(names)}")
+        raise ValueError(f"{concept}: demos disagree on the argument names: {sorted(names)}")
 
+    chosen_names = next(iter(names))
     return SearchTask(name=concept, examples=examples,
-                      param_name=next(iter(names)), demo_ids=tuple(ids),
+                      param_name=chosen_names[0] if len(chosen_names) == 1 else chosen_names,
+                      demo_ids=tuple(ids),
                       instruction=str(demos[0].get("language_instruction", "")).strip(),
                       observation_mode=observation_mode,
                       srn_tables=_tables(demos, pitch, observation_mode, executor))
@@ -281,10 +325,13 @@ def demo_tasks(concept: str, demos: Sequence[dict], sketch_infos: Sequence[dict]
     tables = _tables(demos, pitch, observation_mode, executor)
     tasks = []
     for i, (demo, info) in enumerate(zip(demos, sketch_infos)):
-        name, value = _parameter(info)
+        arg_names, values = _parameter(info)
         tasks.append(SearchTask(name=f"{concept}_{demo.get('demo_id')}",
-                                examples=[(value, _target(demo, pitch, observation_mode))],
-                                param_name=name, demo_ids=(str(demo.get("demo_id")),),
+                                examples=[(values[0] if len(values) == 1 else values,
+                                           _target(demo, pitch, observation_mode))],
+                                param_name=(arg_names[0] if len(arg_names) == 1
+                                            else arg_names),
+                                demo_ids=(str(demo.get("demo_id")),),
                                 instruction=str(demo.get("language_instruction", "")).strip(),
                                 observation_mode=observation_mode,
                                 srn_tables=[tables[i]] if tables else [],
@@ -330,8 +377,13 @@ def build_tasks(grouped: Dict[str, Sequence[dict]], sketches: Dict[str, Sequence
                 executor=None) -> Tuple[List[SearchTask], Dict[str, List[str]]]:
     '''Build every task, and report which demos each one used.
 
-    Returns (tasks, {concept: [demo_id, ...]}). The second value is written to
-    demo_selection.json so the demo choice is auditable.
+    Returns (tasks, {concept: [demo_id, ...]}, {concept: reason}). The second value is written
+    to demo_selection.json so the demo choice is auditable; the third lists concepts the search
+    cannot represent.
+
+    A concept the grammar has no type for is RECORDED, not raised. `wall` takes another concept
+    as its argument, and letting that abort the run would cost the other 98 -- which is what
+    happened: a default run over `ALL_CONCEPTS` died in `_parameter` after loading every demo.
     '''
     if granularity not in ("concept", "demo"):
         raise ValueError(f"unknown task granularity {granularity!r}")
@@ -341,16 +393,31 @@ def build_tasks(grouped: Dict[str, Sequence[dict]], sketches: Dict[str, Sequence
 
     tasks: List[SearchTask] = []
     used: Dict[str, List[str]] = {}
+    skipped: Dict[str, str] = {}
     for concept, demos in grouped.items():
         infos = list(sketches[concept])
         picked = select_demos(demos, infos, demos_per_concept, selection)
         chosen_demos = [demos[i] for i in picked]
         chosen_infos = [infos[i] for i in picked]
-        if granularity == "concept":
-            tasks.append(concept_task(concept, chosen_demos, chosen_infos, pitch,
-                                      observation_mode=observation_mode, executor=executor))
-        else:
-            tasks.extend(demo_tasks(concept, chosen_demos, chosen_infos, pitch,
-                                    observation_mode=observation_mode, executor=executor))
+        try:
+            if granularity == "concept":
+                tasks.append(concept_task(concept, chosen_demos, chosen_infos, pitch,
+                                          observation_mode=observation_mode,
+                                          executor=executor))
+            else:
+                tasks.extend(demo_tasks(concept, chosen_demos, chosen_infos, pitch,
+                                        observation_mode=observation_mode, executor=executor))
+        except Inexpressible as exc:
+            skipped[concept] = str(exc)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            # ANY failure to build one concept's task is that concept's problem, not the run's.
+            # The dataset is growing to ~100 concepts and will keep growing; a new one that the
+            # sketch, the pitch estimate or the target conversion cannot handle must not cost
+            # the other 98. The exception type is kept so this is a diagnosable record rather
+            # than a shrug -- `Inexpressible` above is the EXPECTED shape of this, and anything
+            # arriving here is worth reading.
+            skipped[concept] = f"{type(exc).__name__}: {exc}"
+            continue
         used[concept] = [str(d.get("demo_id")) for d in chosen_demos]
-    return tasks, used
+    return tasks, used, skipped

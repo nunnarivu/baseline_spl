@@ -65,17 +65,11 @@ def delta_tokens(previous, current) -> List[str]:
     structure, and encoding it as such keeps the lexicon small and the encoder
     translation-invariant.
 
-    **One token per moving axis, not one per step.** An earlier version named only the
-    *dominant* axis and dropped the rest, which silently made diagonals indistinguishable:
-    a (+1,-1,0) step and a (+1,+1,0) step both have dominant magnitude 1, `max` broke the
-    tie the same way for both, and the second axis was discarded. Measured consequence --
-    `diagonal_45` and `diagonal_135` produced *byte-identical* token sequences, as did
-    `diagonal_225` and `diagonal_315`, so 16 concepts collapsed to 14 distinct inputs. The
-    recognition model was being asked to give different grammars to tasks it could not tell
-    apart, and upstream's own log gave it away as a "14-way auxiliary classification loss".
-
-    Emitting per axis fixes it without touching the lexicon: every token produced here was
-    already in it.
+    **One token per moving axis, not one per step.** Naming only the dominant axis makes
+    diagonals collide -- (+1,-1,0) and (+1,+1,0) tie, so the second axis is lost and
+    `diagonal_45` encodes identically to `diagonal_135`. The recognizer then cannot tell
+    those tasks apart however long it trains. Per-axis costs nothing: every token emitted
+    here is already in the lexicon.
     '''
     d = (current[0] - previous[0], current[1] - previous[1], current[2] - previous[2])
     if d in _UNIT_DELTAS:
@@ -105,7 +99,9 @@ def lexicon() -> List[str]:
     # magnitude of 1 while not being a unit delta, so it renders as e.g. RIGHTx1.
     symbols += [f"{n}x{k}" for n in _UNIT_DELTAS.values() for k in range(1, 5)]
     symbols += [f"n={i}" for i in range(1, MAX_PARAMETER_TOKEN + 1)]
-    symbols += ["n=big"]
+    # "n=big" for a value past the cap; "n=none" for a fixed-size concept, which takes no
+    # integer at all. An unknown symbol is fatal to the extractor, not merely unhelpful.
+    symbols += ["n=big", "n=none"]
     return sorted(set(symbols))
 
 
@@ -117,12 +113,24 @@ def _parameter_token(n) -> str:
     return f"n={n}" if 1 <= n <= MAX_PARAMETER_TOKEN else "n=big"
 
 
+def _parameter_tokens(parameter) -> List[str]:
+    '''One token per integer argument, positional.
+
+    A concept with two arguments encoded as a single token would make `rectangle(5, 3)` and
+    `rectangle(5, 4)` look identical to the model, so it could not learn that the second
+    argument matters. Positional rather than named because the request is positional.
+    '''
+    from baseline_spl.symbolic.ir import args as _args
+
+    return [_parameter_token(v) for v in _args(parameter)] or ["n=none"]
+
+
 def encode(parameter, state) -> Optional[List[str]]:
     '''One example -> a token sequence. None rejects the example.'''
     positions = getattr(state, "positions", None)
     if positions is None:
         return None
-    tokens = ["START", _parameter_token(parameter)]
+    tokens = ["START"] + _parameter_tokens(parameter)
     previous = None
     for cell in positions:
         if previous is not None:
@@ -179,8 +187,11 @@ def build_task(name: str, examples: Sequence[Tuple[int, Sequence]], task=None) -
         # The input tuple must match the request's argument list, because
         # `RecurrentFeatureExtractor` builds `argumentsWithType` from
         # `request.functionArguments()` and `taskOfProgram` samples from it when dreaming.
-        # A closed task takes only the state.
-        pairs.append(((EMPTY,) if closed else (parameter, EMPTY), final))
+        # One entry per integer argument, then the state; a closed task takes only the state.
+        from baseline_spl.symbolic.ir import args as _args
+
+        inputs = () if closed else tuple(_args(parameter))
+        pairs.append((inputs + (EMPTY,), final))
     return Task(name, request, pairs)
 
 
@@ -222,7 +233,9 @@ def make_extractor(tasks: Sequence[Task], hidden: int = 32, cuda: bool = False):
                 # merely unhelpful. Reject the example instead.
                 if any(token not in self.symbolToIndex for token in encoded):
                     return None
-                out.append((([_parameter_token(xs[0])],), encoded))
+                # `xs` is (arg_0, ..., arg_{k-1}, state), so everything but the state is an
+                # argument. At k = 0 that is the empty tuple, which becomes ["n=none"].
+                out.append(((_parameter_tokens(tuple(xs[:-1])),), encoded))
             return out
 
         def taskOfProgram(self, p, tp):
@@ -276,18 +289,24 @@ def make_extractor(tasks: Sequence[Task], hidden: int = 32, cuda: bool = False):
                     return None
                 examples = [((EMPTY,), state)]
             else:
-                pool = self.argumentsWithType.get(tp.functionArguments()[0]) or [3, 4, 5]
-                params = _random.sample(list(pool), min(3, len(pool)))
+                # One pool per integer argument, so a 2-argument dream varies BOTH. Sampling
+                # only the first would teach the model that the second never matters.
+                arg_types = tp.functionArguments()[:-1]
+                pools = [list(self.argumentsWithType.get(t) or [3, 4, 5]) for t in arg_types]
+                draws = [_random.sample(p, min(3, len(p))) for p in pools]
                 examples = []
-                for n in params:
+                for combination in zip(*draws) if len(draws) > 1 else [(v,) for v in draws[0]]:
                     try:
-                        state = fn(n)(EMPTY)
+                        state = fn
+                        for value in combination:
+                            state = state(value)
+                        state = state(EMPTY)
                     except Exception:  # noqa: BLE001
                         return None
                     positions = getattr(state, "positions", None)
                     if not positions or len(positions) > MAX_DREAM_PLACEMENTS:
                         return None
-                    examples.append(((n, EMPTY), state))
+                    examples.append((tuple(combination) + (EMPTY,), state))
                 # Upstream's check, kept where it means something: a program that ignores its
                 # parameter produces the same structure at every size and teaches nothing.
                 outputs = [y.positions for _xs, y in examples]
@@ -332,20 +351,11 @@ def train_recognizer(grammar, tasks: Dict[str, Task], solutions, *,
     -- but it is reported rather than swallowed, because a recognizer that silently never
     trains looks exactly like one that does not help.
 
-    **Training length is the whole ballgame, and getting it wrong is silent.** Upstream's
-    contract (`recognition.py:1269-1272`) is that `steps` and `epochs` both default to
-    9,999,999 and `timeout` is what actually stops training -- i.e. "train until the clock
-    runs out". An earlier version of this function passed `epochs=5` with `timeout=None`,
-    which caps the loop at `epochs x len(frontiers)` gradient steps: with 9 solved tasks that
-    is **45 steps**, against the 10,000 LILO's own config specifies
-    (`template_lilo.json: "recognition_train_steps": 10000`).
-
-    A network trained for 45 steps is barely distinguishable from its random
-    initialisation. It still produces a *different* grammar per task -- random weights do
-    that -- so the wake phase looks like it is conditioning on something, enumeration order
-    changes, throughput changes, and nothing about the run appears broken. What it cannot do
-    is carry any learned signal, which is exactly the failure mode that looks like "the
-    recognition model does not help in this domain".
+    `steps` is the budget that matters; upstream defaults both `steps` and `epochs` to
+    9,999,999 and stops on `timeout` (`recognition.py:1269-1272`). Passing a small `epochs`
+    silently caps training at `epochs x len(frontiers)` gradient steps, and an undertrained
+    network still emits a different grammar per task, so nothing looks wrong. See
+    `configs/default.py:recognition_steps`.
     '''
     from dreamcoder.recognition import RecognitionModel
 

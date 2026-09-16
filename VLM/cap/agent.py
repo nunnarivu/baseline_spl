@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import List
 
 from baseline_spl.common import codegen, dsl_prompt
+from baseline_spl.common.evaluator import ClassEvaluator
 from baseline_spl.common.harness import GeneratedConcept, log
 from baseline_spl.common.primitive_stats import build_stats_block
 from baseline_spl.common.serialize_text import to_demo2code_text
@@ -36,8 +37,8 @@ Below are human demonstrations of this concept. Each [Scenario] is a separate sc
 its own objects, and lists the keyframes of one demonstration: which object moved at each
 step and where it ended up.
 
-Work out for yourself which shift_focus direction (or sequence of directions) accounts for
-the movement between consecutive placements. Your class must reproduce the construction
+Work out for yourself which shift_focus direction (or sequence of directions) and num_steps
+account for the movement between consecutive placements. Your class must reproduce the construction
 procedure these demonstrations show — the same placement order and the same relative
 movement — generalized to any value of the numeric argument.
 
@@ -105,11 +106,21 @@ class CodeAsPoliciesAgent:
             log(f"[cap] {len(images)} keyframe images across {len(demos)} demonstration(s)")
             user_prompt = f"{user_prompt}\n{IMAGE_PREAMBLE}"
 
+        # Scores the helper-expanded class, which is what gets registered. Image runs get no
+        # distances. The harness refuses this with use_demo=False or no sketch.
+        known = list(shared.spl.concept_library.operators.keys())
+        evaluator = ClassEvaluator(
+            shared, demos, sketch_infos, with_numbers=self.demo_modality == "text",
+            transform=lambda c: fgen_expand(c, self.backend, known,
+                                            max_depth=self.configs.max_expansion_depth),
+        ) if self.configs.use_evaluator_feedback else None
+
         code = codegen.generate_with_retries(
             self.backend, system_prompt, user_prompt,
             wanted_name=concept,
             max_retries=self.configs.max_code_retries,
             images=images,
+            evaluator=evaluator,
             log=log,
         )
 
@@ -119,11 +130,12 @@ class CodeAsPoliciesAgent:
         # Code-as-Policies' recursive expansion of undefined helpers. If expansion
         # somehow breaks the class, fall back to the version that already validated
         # rather than registering something broken.
-        known = list(shared.spl.concept_library.operators.keys())
         expanded = fgen_expand(code, self.backend, known,
                                max_depth=self.configs.max_expansion_depth)
         info = {"use_demo": self.use_demo, "demo_modality": self.demo_modality,
                 "expanded": expanded != code}
+        if evaluator is not None:
+            info["evaluator"] = evaluator.record
         if expanded != code:
             try:
                 codegen.validate(expanded)

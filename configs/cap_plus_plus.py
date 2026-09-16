@@ -8,8 +8,8 @@ from SPL.config.spl_config import ALL_CONCEPTS  # noqa: F401  — for setting `c
 # instead of methods. SPL's configured 'gpt-5.1-codex-max' is deprecated and 404s (so is
 # 'gpt-5.2-codex') — set SPL's GeneralizeConfig to CODEGEN_MODEL when you sync it.
 # 'gpt-5.3-codex' also works but is Responses-endpoint only; the backend handles that.
-CODEGEN_MODEL = "gpt-5.1"
-VLM_MODEL = "gpt-5.1"
+CODEGEN_MODEL = "gpt-5.6-luna"
+VLM_MODEL = "gpt-5.6-luna"
 
 
 class CommonConfig:
@@ -17,20 +17,19 @@ class CommonConfig:
 
     # What to run.
     learn = True
-    inference = True
+    inference = False
 
-    # Load concepts learned earlier: resumes an interrupted run, adds concepts to an
-    # existing one, and lets inference run separately from learning. Already-learned
-    # concepts are skipped and metric files are appended to, not overwritten.
-    resume = True
-    # Library to resume from. None = this run's own concept_library.pt.
-    resume_from = None
+    # Concept library to load (None loads nothing). Concepts it holds are not learned again
+    # and the metric files are appended to. See configs/default.py for the full note.
+    load_concept_checkpoint = None
+    skip_loading_concepts = ()
+    ignore_learnt_concepts = False  # True: ignore the learnt concepts and learn remaining
 
     # Data. Use ALL_CONCEPTS for the full sweep. row/tower are smoke-test concepts —
     # an LLM already knows them, so they test plumbing, not capability; pins, psi,
     # arch_bridge and x are the ones that discriminate.
-    concepts = ["row",  "tower", "staircase", "pyramid", "arch_bridge"]
-    num_demos_per_concept = 2
+    concepts = ALL_CONCEPTS
+    num_demos_per_concept = 3
     num_workers = 4
 
     # Models (see the parity note above).
@@ -42,9 +41,16 @@ class CommonConfig:
     #   'default' : standard processing
     service_tier = "flex"
 
-    # Retries on invalid/unparseable code only. Baselines deliberately get no
-    # execution-grounded verification — that loop is an SPL contribution.
+    # Retries per concept class, shared by parse failures and (below) evaluation failures.
     max_code_retries = 3
+
+    # Run each generated class on the demonstrations and retry with a report (crash, block
+    # count, per-block distance to the demo's final state, bookkeeping), as SPL's Generalize
+    # evaluator does. Passes when every block is within sketch_val_state_error_threshold.
+    # Not given: SPL's reward and its MCTS-plan reference. Image-only variants get the report
+    # without distances. Needs sketch_mode='corrected' and use_demo=True; SayCan ignores it.
+    # False: parse retries only, the loop stays an SPL contribution.
+    use_evaluator_feedback = True
 
     # What signature information reaches program generation.
     #   'corrected' : the sketch, after SPL's validate_and_correct_sketch
@@ -67,11 +73,11 @@ class CommonConfig:
     vlm_max_image_px = 512
     # Every keyframe here is a placement, so subsampling deletes construction steps.
     # Last resort only; the serializer warns when it fires.
-    vlm_max_keyframes = 40
+    vlm_max_keyframes = 100
 
     # Output directory under runs/. None means use the config file's own name, so two
     # configs can never overwrite each other's results.
-    run_name = "cap_text_sketch_dry_run"
+    run_name = "cap_plus_plus_run1"
 
 
 class CapConfig(CommonConfig):
@@ -86,7 +92,7 @@ class CapConfig(CommonConfig):
     # How the demonstration is shown when use_demo is True.
     #   'text'   : the serialized [Scenario i] block, as Demo2Code receives it
     #   'images' : the keyframe images, passed into the single code-generation call
-    demo_modality = "text"
+    demo_modality = "images"
 
     # Depth limit for CaP's recursive generation of helpers the code calls but
     # never defines.
@@ -105,7 +111,8 @@ class SayCanConfig(CommonConfig):
     '''SayCan (Ahn et al., 2022): one primitive at a time, no program. The control for
     whether a program is needed at all.
 
-    sketch_mode is ignored — SayCan emits actions, so there is no signature to give it.
+    sketch_mode and use_evaluator_feedback are ignored — SayCan emits actions, so there is
+    no signature to give it and no class to evaluate.
     '''
 
     # How the demonstrations are shown: "text" : the serialized [Scenario i] block, or the "images".

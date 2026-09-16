@@ -1,0 +1,108 @@
+{
+  "solved": [
+    "column",
+    "row",
+    "tower"
+  ],
+  "approximate": [],
+  "unsolved": [],
+  "solved_by_llm": [],
+  "solved_by_enumeration": [
+    "column",
+    "row",
+    "tower"
+  ],
+  "abstractions": [
+    "#(lambda (lambda (lambda (loop $1 (lambda (lambda (shift $4 (place $0)))) $0))))"
+  ],
+  "documentation": {},
+  "evaluator": {
+    "evaluator": "srn_likelihood",
+    "accept_criterion": "mahalanobis",
+    "accept_threshold": 2.0,
+    "variance_penalty_weight": 1.2,
+    "saved_resync": true
+  },
+  "total_seconds": 18.8,
+  "iterations": [
+    {
+      "iteration": 0,
+      "solved": [
+        "column",
+        "row",
+        "tower"
+      ],
+      "newly_solved": [
+        "row",
+        "tower",
+        "column"
+      ],
+      "abstractions": [
+        "#(lambda (lambda (lambda (loop $1 (lambda (lambda (shift $4 (place $0)))) $0))))"
+      ],
+      "programs_enumerated": 6760,
+      "seconds": 18.78,
+      "programs_per_second": 359.9,
+      "max_mdl_reached": 13.5,
+      "recognition_trained": false,
+      "solved_by_llm": [],
+      "seconds_by_stage": {
+        "proposal": 0.0,
+        "wake": 18.78,
+        "conditioning": 0.0,
+        "compress": 0.02,
+        "documentation": 0.0,
+        "reweight": 0.0,
+        "recognition": 0.0
+      }
+    }
+  ],
+  "per_task": {
+    "row": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.4,
+      "search_score": 0.3252,
+      "trace_distance": null,
+      "programs_tried": 6760,
+      "seconds": 18.78,
+      "program": "(lambda (lambda (loop $1 (lambda (lambda (shift RIGHT (place $0)))) $0)))"
+    },
+    "tower": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.4,
+      "search_score": 0.4638,
+      "trace_distance": null,
+      "programs_tried": 6760,
+      "seconds": 18.78,
+      "program": "(lambda (lambda (loop $1 (lambda (lambda (shift TOP (place $0)))) $0)))"
+    },
+    "column": {
+      "status": "solved",
+      "solved_by": "enumeration",
+      "mdl": 13.4,
+      "search_score": 0.6188,
+      "trace_distance": null,
+      "programs_tried": 6760,
+      "seconds": 18.78,
+      "program": "(lambda (lambda (loop $1 (lambda (lambda (shift FRONT (place $0)))) $0)))"
+    }
+  },
+  "search_seconds": 18.81,
+  "demo_selection": {
+    "row": [
+      "0000",
+      "0032"
+    ],
+    "tower": [
+      "0004",
+      "0020"
+    ],
+    "column": [
+      "0002",
+      "0018"
+    ]
+  },
+  "task_granularity": "concept"
+}

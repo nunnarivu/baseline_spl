@@ -31,6 +31,19 @@ from baseline_spl.symbolic.oracles import ORACLES
 from baseline_spl.symbolic.search import SearchTask
 
 
+def _settings(**overrides):
+    """Driver settings for a test: recognition off unless a test asks for it.
+
+    Training a recognition model takes minutes; these tests exercise the proposal and
+    compression paths, so they leave it off. That is also why the suite alone cannot vouch for
+    the recognition settings -- see tests/test_tasks.py, which checks them directly.
+    """
+    from baseline_spl.symbolic.settings import RecognitionSettings, SearchSettings
+
+    overrides.setdefault("recognition", RecognitionSettings(enabled=False))
+    return SearchSettings(**overrides)
+
+
 def _task(concept: str, params=(3, 5)) -> SearchTask:
     return SearchTask(name=concept,
                       examples=[(n, positions(ORACLES[concept], n)) for n in params],
@@ -386,8 +399,8 @@ def test_driver_solves_by_proposal_without_enumerating():
     def propose(g, pending, iteration, docs, solved):
         return {t.name: [sources[t.name]] for t in pending}
 
-    result = driver.run(tasks, iterations=1, timeout=0.0, use_recognition=False,
-                        use_library=False, propose=propose, log=lambda _m: None)
+    result = driver.run(tasks, _settings(iterations=1, timeout=0.0, use_library=False),
+                        propose=propose, log=lambda _m: None)
 
     assert result.solved == ["row", "tower"]
     assert result.solved_by == {"row": "llm", "tower": "llm"}
@@ -402,8 +415,7 @@ def test_driver_ignores_a_proposal_that_does_not_solve_the_task():
     tasks = [_task("row")]
     wrong = Program.parse("(lambda (lambda (place $0)))")
 
-    result = driver.run(tasks, iterations=1, timeout=0.0, use_recognition=False,
-                        use_library=False,
+    result = driver.run(tasks, _settings(iterations=1, timeout=0.0, use_library=False),
                         propose=lambda g, p, i, d, s: {"row": [wrong]},
                         log=lambda _m: None)
 
@@ -416,8 +428,9 @@ def test_driver_ignores_a_proposal_that_does_not_solve_the_task():
 
 def test_b3a_is_unchanged_when_no_hooks_are_passed():
     '''The control must stay a control: with no hooks the driver never mentions an LLM.'''
-    result = driver.run([_task("row")], iterations=1, timeout=20.0, use_recognition=False,
-                        use_library=False, log=lambda _m: None)
+    result = driver.run([_task("row")],
+                        _settings(iterations=1, timeout=20.0, use_library=False),
+                        log=lambda _m: None)
     assert result.solved == ["row"]
     assert result.solved_by == {"row": "enumeration"}
     assert result.reports[0].proposed_by_llm == []
@@ -507,7 +520,7 @@ def test_documentation_closes_the_loop():
                            log=lambda _m: None)
     namer = LibraryNamer(backend, log=lambda _m: None)
 
-    result = driver.run(tasks, iterations=2, timeout=30.0, use_recognition=False,
+    result = driver.run(tasks, _settings(iterations=2, timeout=30.0),
                         propose=proposer, document=namer, log=lambda _m: None)
 
     assert sorted(result.solved) == sorted(solvable)
@@ -694,20 +707,42 @@ def test_matched_comparison_configs_really_are_matched():
     600 s budget while B3-a got 14,400 s, a 24x mismatch, and nothing complained: the run
     completed, wrote plausible numbers, and only the wall clock gave it away.
 
-    Scoped to the r2_* configs, which are the matched-comparison ones. default.py is
-    deliberately unmatched (300 s vs 600 s) because it is a template, not an experiment.
+    Every r2_* config that learns is checked, not just the two where the bug was found. The
+    second instance proved the point: `r2_demo16` gave B3-a 32 workers and B3-b 16, so at a
+    shared 14,400 s wall clock B3-b would have enumerated roughly half as many programs and
+    the run would have measured the core count. `cpus` is in the list for that reason.
+
+    default.py is deliberately unmatched (300 s vs 600 s) because it is a template, not an
+    experiment, and `r2_infer8` sets `learn = False`, so it never searches at all.
     '''
     import importlib
 
-    for name in ("r2_full16", "r2_lilo16"):
+    #: Anything that decides how much search each side gets, or what counts as a solution.
+    MATCHED = ("enumeration_timeout", "search_iterations", "cpus", "grammar_level",
+               "accept_tau", "observation_mode", "evaluator", "task_granularity",
+               "use_recognition", "recognition_steps", "helmholtz_ratio", "max_mdl",
+               "maximum_frontier", "use_continuation_type")
+
+    missing = object()
+
+    def check(label, a_owner, a_cls, b_owner, b_cls):
+        for knob in MATCHED:
+            a, b = getattr(a_cls, knob, missing), getattr(b_cls, knob, missing)
+            assert a == b, (
+                f"{label}: {a_owner} has {knob}={a!r} but {b_owner} has {knob}={b!r}. The "
+                f"comparison would confound the LLM's contribution with the search budget.")
+
+    for name in ("r2_full16", "r2_lilo16", "r2_full16_rfix", "r2_lilo16_rfix",
+                 "r2_demo16", "r2_full16_norecog", "r2_demo16_norecog"):
         module = importlib.import_module(f"baseline_spl.configs.{name}")
-        dreamcoder = module.DreamCoderConfig
-        lilo = module.LiloConfig
-        assert lilo.enumeration_timeout == dreamcoder.enumeration_timeout, (
-            f"{name}: B3-b searches for {lilo.enumeration_timeout}s while B3-a searches for "
-            f"{dreamcoder.enumeration_timeout}s; the comparison would confound the LLM's "
-            f"contribution with the search budget")
-        assert lilo.search_iterations == dreamcoder.search_iterations, name
-        assert lilo.grammar_level == dreamcoder.grammar_level, name
-        assert lilo.accept_tau == dreamcoder.accept_tau, name
-        assert lilo.observation_mode == dreamcoder.observation_mode, name
+        check(name, "B3-a", module.DreamCoderConfig, "B3-b", module.LiloConfig)
+
+    # The pairs above are matched WITHIN a config file, but the concept-level head-to-head is
+    # actually run ACROSS two of them -- B3-a from r2_full16*, B3-b from r2_lilo16* -- because
+    # the run directory is named after `BASELINE_CONFIG` and the two must not collide. Today
+    # they agree only because r2_lilo16 inherits from r2_full16; assert it rather than trust it.
+    for a_name, b_name in (("r2_full16", "r2_lilo16"), ("r2_full16_rfix", "r2_lilo16_rfix")):
+        a_mod = importlib.import_module(f"baseline_spl.configs.{a_name}")
+        b_mod = importlib.import_module(f"baseline_spl.configs.{b_name}")
+        check(f"{a_name} vs {b_name}", f"{a_name}.DreamCoderConfig", a_mod.DreamCoderConfig,
+              f"{b_name}.LiloConfig", b_mod.LiloConfig)

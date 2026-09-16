@@ -30,6 +30,7 @@ from baseline_spl.symbolic.bridge import CONCEPT_REQUEST, grammar as build_gramm
 from baseline_spl.symbolic import recognition
 from baseline_spl.symbolic.search import (DEFAULT_MAXIMUM_FRONTIER, SearchStats,
                                           SearchTask, Solution, wake)
+from baseline_spl.symbolic.settings import SearchSettings
 from baseline_spl.symbolic.stitch_bridge import best_compression, program_mdl, reweight
 
 
@@ -141,17 +142,261 @@ class RunResult:
         }
 
 
-def run(tasks: Sequence[SearchTask], *, level: str = "standard", iterations: int = 3,
-        timeout: float = 60.0, max_mdl: float = 100.0, use_library: bool = True,
-        pseudo_counts: float = 1.0, max_arity: int = 3,
-        maximum_frontier: int = DEFAULT_MAXIMUM_FRONTIER, cpus: int = 1,
-        use_recognition: bool = True, recognition_epochs=None,
-        recognition_steps: int = 10000, recognition_timeout: float = 1800.0,
-        recognition_hidden: int = 64, recognition_contextual: bool = True,
-        recognition_bias_optimal: bool = True, recognition_auxiliary_loss: bool = True,
-        helmholtz_ratio: float = 0.5, propose=None, document=None, evaluator=None,
-        int_literals_upto: int = 0, continuation: bool = True,
-        log=print) -> RunResult:
+class _Loop:
+    """One wake/sleep run.
+
+    The phases share a lot of state -- the growing library, each task's best solution so far,
+    the trained recognizer -- so they are methods over that state rather than functions with
+    long parameter lists. `run()` below is the whole loop, and reads as the sequence of phases
+    it is.
+    """
+
+    def __init__(self, tasks, settings, evaluator, propose, document, log):
+        self.tasks = list(tasks)
+        self.settings = settings
+        self.evaluator = evaluator
+        self.propose_hook = propose
+        self.document_hook = document
+        self.log = log
+
+        self.result = RunResult(grammar=build_grammar(
+            settings.level, continuation=settings.continuation,
+            int_literals_upto=settings.int_literals_upto))
+        self.result.evaluator = evaluator.describe()
+        self.result.solutions = {t.name: Solution(task=t.name) for t in self.tasks}
+        self.targets = {t.name: t for t in self.tasks}
+        self.dc_tasks = recognition.build_tasks(self.tasks)
+        # task -> its solution rewritten to call the library. Kept apart from
+        # Solution.program so the originally-found program stays on record.
+        self.library_form: Dict[str, Program] = {}
+        self.recognizer = None
+
+    # ---------------------------------------------------------------- phases -- #
+
+    def _pending(self) -> List[SearchTask]:
+        return [t for t in self.tasks if not self.result.solutions[t.name].exact]
+
+    def _requests(self) -> Dict[str, object]:
+        """task name -> the type its programs must be scored at.
+
+        Compression and re-weighting receive `(task name, program)` pairs, so they cannot ask a
+        task for its own type. Without this map they assumed the concept-level request, which
+        scores a closed demo-level program at -inf and silently disables library learning.
+        """
+        return {name: task.request for name, task in self.targets.items()}
+
+    def _propose(self, index: int, pending) -> Tuple[List[str], float]:
+        """B3-b's wake phase, ahead of enumeration so an LLM-solved task does not then spend
+        enumeration budget. With `timeout=0` this becomes the LLM-only ablation."""
+        if self.propose_hook is None:
+            return [], 0.0
+        started = time.time()
+        # Few-shot material: what this method's own search has already found, paired with the
+        # instruction it was found for. Never `demo['program']` -- these are the method's
+        # discoveries, exactly what LILO shows itself.
+        found = [(self.targets[n].instruction or n, str(s.program))
+                 for n, s in self.result.solutions.items() if s.exact and n in self.targets]
+        try:
+            candidates = self.propose_hook(self.result.grammar, pending, index,
+                                           self.result.documentation, found)
+        except Exception as exc:  # noqa: BLE001 - a failed proposal must not end the run
+            self.log(f"[iter {index}] proposer raised ({type(exc).__name__}: {exc}); "
+                     f"falling back to enumeration.")
+            candidates = {}
+        names = _accept_proposals(self.result, candidates, self.targets, self.evaluator,
+                                  self.settings.maximum_frontier, log=self.log)
+        seconds = time.time() - started
+        self.log(f"[iter {index}] proposer solved {len(names)} task(s) "
+                 f"({', '.join(names) or 'none'}) in {seconds:.0f}s")
+        return names, seconds
+
+    def _train_recognition(self, index: int) -> float:
+        """Sleep-R, trained BEFORE this iteration's enumeration, as LILO orders it
+        (llm_solver -> optimize_model_for_frontiers -> enumerate). Training here rather than
+        at the end of the iteration is what lets enumeration benefit from the solutions the
+        proposer just found, in the same iteration."""
+        recognition_settings = self.settings.recognition
+        if not recognition_settings.enabled:
+            return 0.0
+        started = time.time()
+        # Reassigned unconditionally: if training fails this iteration searches under the
+        # global grammar rather than a stale model from the previous one.
+        self.recognizer = recognition.train_recognizer(
+            self.result.grammar, self.dc_tasks, self.result.solutions,
+            epochs=recognition_settings.epochs, steps=recognition_settings.steps,
+            timeout=recognition_settings.timeout,
+            helmholtz_ratio=recognition_settings.helmholtz_ratio,
+            hidden=recognition_settings.hidden,
+            contextual=recognition_settings.contextual,
+            bias_optimal=recognition_settings.bias_optimal,
+            auxiliary_loss=recognition_settings.auxiliary_loss,
+            cpus=self.settings.cpus, log=self.log)
+        return time.time() - started
+
+    def _wake(self, index: int, pending) -> Tuple[SearchStats, float]:
+        """Enumerate. Sleep-R's output is consumed here: with a recognizer trained, each task
+        gets its own grammar rather than one global one."""
+        settings = self.settings
+        if not pending:
+            return SearchStats(), 0.0
+        if settings.timeout <= 0:
+            # The LLM-only ablation: proposal is the entire wake phase.
+            self.log(f"[iter {index}] enumeration disabled (timeout={settings.timeout}); "
+                     f"{len(pending)} task(s) left to the proposer")
+            return SearchStats(), 0.0
+
+        started = time.time()
+        searching_with = self.result.grammar
+        if self.recognizer is not None:
+            searching_with = recognition.grammars_for(
+                self.recognizer, {t.name: self.dc_tasks[t.name] for t in pending},
+                self.result.grammar, log=self.log)
+        conditioning_seconds = time.time() - started
+        conditioned = "per-task grammars" if self.recognizer is not None else "one grammar"
+        self.log(f"[iter {index}] searching {len(pending)} task(s) under {conditioned} of "
+                 f"{len(self.result.grammar.productions)} productions")
+        stats = wake(searching_with, pending, timeout=settings.timeout,
+                     max_mdl=settings.max_mdl, evaluator=self.evaluator,
+                     maximum_frontier=settings.maximum_frontier, cpus=settings.cpus,
+                     log=self.log)
+        return stats, conditioning_seconds
+
+    def _adopt(self, stats: SearchStats, report: IterationReport) -> None:
+        """Fold the wake phase's findings into the run, keeping the better of the two: an
+        exact hit always wins, otherwise the nearer miss."""
+        for name, solution in stats.per_task.items():
+            previous = self.result.solutions[name]
+            if solution.exact or (previous.program is None) or (
+                    solution.program is not None and solution.distance < previous.distance):
+                self.result.solutions[name] = solution
+            if solution.exact:
+                report.newly_solved.append(name)
+                self.result.solved_by[name] = "enumeration"
+        report.solved = sorted(n for n, s in self.result.solutions.items() if s.exact)
+
+    def _compress(self, index: int, report: IterationReport, solved_programs):
+        """Sleep-G: extract abstractions, adopt the rewritten solutions, document them."""
+        settings = self.settings
+        if not (settings.use_library and len(solved_programs) >= 2):
+            return solved_programs
+
+        started = time.time()
+        compression, grammar_with_library = best_compression(
+            self.result.grammar, solved_programs, max_arity=settings.max_arity,
+            level=settings.level, requests=self._requests())
+        report.compress_seconds = time.time() - started
+        if not compression.abstractions:
+            self.log(f"[iter {index}] no abstraction lowered the corpus description length"
+                     + (f" ({compression.error})" if compression.error else ""))
+            return solved_programs
+
+        self.result.grammar = grammar_with_library
+        self.result.abstractions = _merge(self.result.abstractions, compression.abstractions)
+        report.abstractions = [str(a) for a in compression.abstractions]
+        adopted = _adopt_rewritten(compression, self.targets, self.library_form,
+                                   self.evaluator)
+        self.log(f"[iter {index}] kept {len(compression.abstractions)} abstraction(s); "
+                 f"library now has {len(self.result.abstractions)}; "
+                 f"{adopted} solution(s) rewritten against it")
+        solved_programs = _corpus(self.result, self.library_form)
+        self._document(index, report, compression.abstractions, solved_programs)
+        return solved_programs
+
+    def _document(self, index, report, abstractions, solved_programs) -> None:
+        """LILO's third contribution: name and describe each new abstraction so the next
+        proposal prompt can refer to the library in words. Failure is non-fatal -- an
+        undocumented abstraction simply keeps its anonymous form."""
+        if self.document_hook is None:
+            return
+        started = time.time()
+        try:
+            docs = self.document_hook(abstractions, solved_programs) or {}
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[iter {index}] auto-documentation raised "
+                     f"({type(exc).__name__}: {exc}); abstractions stay anonymous.")
+            docs = {}
+        self.result.documentation.update(docs)
+        report.documentation_seconds = time.time() - started
+        named = ", ".join(d.get("readable_name", "?") for d in docs.values())
+        self.log(f"[iter {index}] documented {len(docs)} abstraction(s)"
+                 + (f": {named}" if named else ""))
+
+    def _reweight(self, index: int, report: IterationReport, solved_programs) -> None:
+        """Refit production probabilities to what the solutions actually used.
+
+        On the LIBRARY FORM of each solution, not the inlined original: re-weighting on the
+        originals gives every abstraction a usage count of zero and drives its probability
+        DOWN (measured -2.944 for one just accepted), so the sleep phase ends up penalising
+        the library it just built.
+        """
+        if not solved_programs:
+            return
+        started = time.time()
+        requests = self._requests()
+        self.result.grammar = reweight(self.result.grammar, solved_programs,
+                                       self.settings.pseudo_counts, log=self.log,
+                                       requests=requests)
+        report.reweight_seconds = time.time() - started
+        mean = sum(program_mdl(self.result.grammar, p, requests.get(n))
+                   for n, p in solved_programs) / len(solved_programs)
+        self.log(f"[iter {index}] re-weighted on {len(solved_programs)} solution(s); "
+                 f"mean solved MDL now {mean:.1f}")
+
+    # ------------------------------------------------------------------ loop -- #
+
+    def run(self) -> RunResult:
+        self.log(f"acceptance: {self.result.evaluator}")
+        started = time.time()
+
+        for index in range(self.settings.iterations):
+            pending = self._pending()
+            if not pending:
+                self.log(f"[iter {index}] every task solved; stopping early.")
+                break
+
+            proposed_names, proposal_seconds = self._propose(index, pending)
+            if proposed_names:
+                pending = self._pending()
+                if not pending:
+                    self.log(f"[iter {index}] every task solved by proposal; "
+                             f"skipping enumeration.")
+
+            recognition_seconds = self._train_recognition(index)
+            stats, conditioning_seconds = self._wake(index, pending)
+
+            report = IterationReport(
+                index=index, programs_enumerated=stats.programs_enumerated,
+                seconds=stats.seconds, rate=stats.rate,
+                max_mdl_reached=stats.max_mdl_reached, wake_seconds=stats.seconds,
+                conditioning_seconds=conditioning_seconds,
+                proposal_seconds=proposal_seconds, proposed_by_llm=proposed_names,
+                recognition_seconds=recognition_seconds,
+                recognition=self.recognizer is not None)
+            report.newly_solved.extend(proposed_names)
+            self._adopt(stats, report)
+            self.log(f"[iter {index}] {len(report.newly_solved)} newly solved "
+                     f"({', '.join(report.newly_solved) or 'none'}); "
+                     f"{stats.programs_enumerated:,} programs at {stats.rate:,.0f}/s")
+
+            solved_programs = _corpus(self.result, self.library_form)
+            solved_programs = self._compress(index, report, solved_programs)
+            self._reweight(index, report, solved_programs)
+
+            self.result.reports.append(report)
+            if not report.newly_solved and not report.abstractions:
+                self.log(f"[iter {index}] neither the solutions nor the library changed; "
+                         f"stopping.")
+                break
+
+        self.result.seconds = time.time() - started
+        self.log(f"done in {self.result.seconds:.0f}s: {len(self.result.solved)} solved, "
+                 f"{len(self.result.approximate)} approximate, "
+                 f"{len(self.result.unsolved)} unsolved")
+        return self.result
+
+
+def run(tasks: Sequence[SearchTask], settings: Optional[SearchSettings] = None, *,
+        propose=None, document=None, evaluator=None, log=print) -> RunResult:
     '''Search for a program for every task, growing a library as it goes.
 
     `propose` and `document` are B3-b's (LILO's) two additions, and they are the *only*
@@ -168,183 +413,8 @@ def run(tasks: Sequence[SearchTask], *, level: str = "standard", iterations: int
     '''
     from baseline_spl.symbolic.search import DEFAULT_EVALUATOR
 
-    evaluator = evaluator or DEFAULT_EVALUATOR
-    result = RunResult(grammar=build_grammar(level, continuation=continuation,
-                                             int_literals_upto=int_literals_upto))
-    result.evaluator = evaluator.describe()
-    result.solutions = {t.name: Solution(task=t.name) for t in tasks}
-    log(f"acceptance: {result.evaluator}")
-    # task -> its solution rewritten to call the library. Kept apart from Solution.program so
-    # the originally-found program stays on record in search_stats.json.
-    library_form: Dict[str, Program] = {}
-    targets = {t.name: t for t in tasks}
-    dc_tasks = recognition.build_tasks(tasks)
-    recognizer = None
-    started = time.time()
-
-    for index in range(iterations):
-        pending = [t for t in tasks if not result.solutions[t.name].exact]
-        if not pending:
-            log(f"[iter {index}] every task solved; stopping early.")
-            break
-
-        # B3-b's wake phase, ahead of enumeration so an LLM-solved task does not then spend
-        # enumeration budget. With `timeout=0` this becomes the LLM-only ablation.
-        proposal_seconds = 0.0
-        proposed_names: List[str] = []
-        if propose is not None:
-            _t = time.time()
-            # Few-shot material: what this method's own search has already found, paired with
-            # the instruction it was found for. Never `demo['program']` -- these are the
-            # method's discoveries, exactly what LILO shows itself and what SPL's library
-            # gives its Generalize stage.
-            found = [(targets[n].instruction or n, str(s.program))
-                     for n, s in result.solutions.items()
-                     if s.exact and n in targets]
-            try:
-                candidates = propose(result.grammar, pending, index,
-                                     result.documentation, found)
-            except Exception as exc:  # noqa: BLE001 - a failed proposal must not end the run
-                log(f"[iter {index}] proposer raised ({exc}); falling back to enumeration.")
-                candidates = {}
-            proposed_names = _accept_proposals(result, candidates, targets, evaluator,
-                                               maximum_frontier, log=log)
-            proposal_seconds = time.time() - _t
-            log(f"[iter {index}] proposer solved {len(proposed_names)} task(s) "
-                f"({', '.join(proposed_names) or 'none'}) in {proposal_seconds:.0f}s")
-            pending = [t for t in tasks if not result.solutions[t.name].exact]
-            if not pending:
-                log(f"[iter {index}] every task solved by proposal; skipping enumeration.")
-
-        # Sleep-R, trained BEFORE this iteration's enumeration, as LILO orders it
-        # (template_lilo.json: llm_solver -> optimize_model_for_frontiers -> enumerate).
-        # Training here rather than at the end of the iteration is what lets enumeration
-        # benefit from the solutions the proposer just found, in the same iteration.
-        recognition_seconds = 0.0
-        if use_recognition:
-            _t = time.time()
-            recognizer = recognition.train_recognizer(
-                result.grammar, dc_tasks, result.solutions,
-                epochs=recognition_epochs, steps=recognition_steps,
-                timeout=recognition_timeout, helmholtz_ratio=helmholtz_ratio,
-                hidden=recognition_hidden, contextual=recognition_contextual,
-                bias_optimal=recognition_bias_optimal,
-                auxiliary_loss=recognition_auxiliary_loss,
-                cpus=cpus, log=log)
-            recognition_seconds = time.time() - _t
-
-        # Sleep-R's output is consumed here: with a recognizer trained, each task is
-        # enumerated under its own grammar rather than one global one, which is also what
-        # makes the wake phase worth parallelising.
-        conditioning_seconds = 0.0
-        stats = SearchStats()
-        if pending and timeout > 0:
-            searching_with = result.grammar
-            _t = time.time()
-            if recognizer is not None:
-                searching_with = recognition.grammars_for(
-                    recognizer, {t.name: dc_tasks[t.name] for t in pending},
-                    result.grammar, log=log)
-            conditioning_seconds = time.time() - _t
-            conditioned = "per-task grammars" if recognizer is not None else "one grammar"
-            log(f"[iter {index}] searching {len(pending)} task(s) under {conditioned} of "
-                f"{len(result.grammar.productions)} productions")
-            stats = wake(searching_with, pending, timeout=timeout, max_mdl=max_mdl,
-                         evaluator=evaluator,
-                         maximum_frontier=maximum_frontier, cpus=cpus, log=log)
-        elif pending:
-            # timeout <= 0 is the LLM-only ablation: proposal is the entire wake phase.
-            log(f"[iter {index}] enumeration disabled (timeout={timeout}); "
-                f"{len(pending)} task(s) left to the proposer")
-
-        report = IterationReport(index=index, programs_enumerated=stats.programs_enumerated,
-                                 seconds=stats.seconds, rate=stats.rate,
-                                 max_mdl_reached=stats.max_mdl_reached,
-                                 wake_seconds=stats.seconds,
-                                 conditioning_seconds=conditioning_seconds,
-                                 proposal_seconds=proposal_seconds,
-                                 proposed_by_llm=proposed_names,
-                                 recognition_seconds=recognition_seconds,
-                                 recognition=recognizer is not None)
-        report.newly_solved.extend(proposed_names)
-        for name, solution in stats.per_task.items():
-            previous = result.solutions[name]
-            # Keep the better of the two: an exact hit always wins, otherwise the nearer miss.
-            if solution.exact or (previous.program is None) or (
-                    solution.program is not None and solution.distance < previous.distance):
-                result.solutions[name] = solution
-            if solution.exact:
-                report.newly_solved.append(name)
-                result.solved_by[name] = "enumeration"
-        report.solved = sorted(n for n, s in result.solutions.items() if s.exact)
-        log(f"[iter {index}] {len(report.newly_solved)} newly solved "
-            f"({', '.join(report.newly_solved) or 'none'}); "
-            f"{stats.programs_enumerated:,} programs at {stats.rate:,.0f}/s")
-
-        # Programs are carried forward in *library form* -- STITCH's rewritten versions,
-        # which call the abstractions. This matters twice over, and getting it wrong made the
-        # library actively harmful:
-        #   - re-weighting on the inlined originals gives every abstraction a usage count of
-        #     zero, driving its probability DOWN (measured: -2.944 for one just accepted),
-        #   - and the next compression round sees no abstraction calls, so it can never build
-        #     an abstraction on top of an abstraction.
-        solved_programs = _corpus(result, library_form)
-
-        if use_library and len(solved_programs) >= 2:
-            _t = time.time()
-            compression, grammar_with_library = best_compression(
-                result.grammar, solved_programs, max_arity=max_arity, level=level)
-            report.compress_seconds = time.time() - _t
-            if compression.abstractions:
-                result.grammar = grammar_with_library
-                result.abstractions = _merge(result.abstractions, compression.abstractions)
-                report.abstractions = [str(a) for a in compression.abstractions]
-                adopted = _adopt_rewritten(compression, targets, library_form, evaluator)
-                log(f"[iter {index}] kept {len(compression.abstractions)} abstraction(s); "
-                    f"library now has {len(result.abstractions)}; "
-                    f"{adopted} solution(s) rewritten against it")
-                solved_programs = _corpus(result, library_form)
-
-                # LILO's third contribution: name and describe each new abstraction so the
-                # next proposal prompt can refer to the library in words rather than as an
-                # anonymous s-expression. Failure is non-fatal -- an undocumented
-                # abstraction simply keeps its anonymous form.
-                if document is not None:
-                    _t = time.time()
-                    try:
-                        docs = document(compression.abstractions, solved_programs) or {}
-                    except Exception as exc:  # noqa: BLE001
-                        log(f"[iter {index}] auto-documentation raised ({exc}); "
-                            f"abstractions stay anonymous.")
-                        docs = {}
-                    result.documentation.update(docs)
-                    report.documentation_seconds = time.time() - _t
-                    named = ", ".join(d.get("readable_name", "?") for d in docs.values())
-                    log(f"[iter {index}] documented {len(docs)} abstraction(s)"
-                        + (f": {named}" if named else ""))
-            else:
-                log(f"[iter {index}] no abstraction lowered the corpus description length"
-                    + (f" ({compression.error})" if compression.error else ""))
-
-        if solved_programs:
-            _t = time.time()
-            result.grammar = reweight(result.grammar, solved_programs, pseudo_counts, log=log)
-            report.reweight_seconds = time.time() - _t
-            mean = sum(program_mdl(result.grammar, p)
-                       for _n, p in solved_programs) / len(solved_programs)
-            log(f"[iter {index}] re-weighted on {len(solved_programs)} solution(s); "
-                f"mean solved MDL now {mean:.1f}")
-
-        result.reports.append(report)
-
-        if not report.newly_solved and not report.abstractions:
-            log(f"[iter {index}] neither the solutions nor the library changed; stopping.")
-            break
-
-    result.seconds = time.time() - started
-    log(f"done in {result.seconds:.0f}s: {len(result.solved)} solved, "
-        f"{len(result.approximate)} approximate, {len(result.unsolved)} unsolved")
-    return result
+    return _Loop(tasks, settings or SearchSettings(), evaluator or DEFAULT_EVALUATOR,
+                 propose, document, log).run()
 
 
 def _accept_proposals(result: RunResult, candidates: Dict[str, Sequence[Program]],
@@ -375,7 +445,8 @@ def _accept_proposals(result: RunResult, candidates: Dict[str, Sequence[Program]
                 continue
             # MDL under the *current* grammar, so a proposal is directly comparable with an
             # enumerated solution and can be handed to compression on the same footing.
-            prior = -program_mdl(result.grammar, program)
+            prior = -program_mdl(result.grammar, program,
+                                 getattr(targets.get(name), "request", None))
             if scorer.accepts(distance):
                 if (solution.add_exact(prior, program, maximum_frontier, distance)
                         and name not in solved):
@@ -389,8 +460,13 @@ def _accept_proposals(result: RunResult, candidates: Dict[str, Sequence[Program]
             # (`search.py:345`): otherwise an approximate LLM proposal would be recorded as
             # untranslatable where an approximate enumerated one is lowered and scored, which
             # would under-report this baseline for no reason but an inconsistency here.
+            # A demo-level task's program is closed (`tstate -> tstate`); hardcoding the
+            # concept-level shape here meant EVERY LLM proposal on a demo-level run failed
+            # translation and was recorded untranslatable. `search.py` gets this right from
+            # `task.closed`; do the same rather than trust the default.
+            closed = bool(getattr(targets.get(name), "closed", False))
             try:
-                solution.term = to_term(solution.program)
+                solution.term = to_term(solution.program, concept_level=not closed)
             except Exception as exc:  # noqa: BLE001
                 log(f"  proposal for {name} could not be read back as a term ({exc})")
     return solved
@@ -445,6 +521,11 @@ def _adopt_rewritten(compression, targets: Dict[str, SearchTask],
             if scorer.accepts(scorer.score(candidate, task)):
                 library_form[task_name] = candidate
                 adopted += 1
-        except Exception:  # noqa: BLE001 - keep the original form for this task
+        except Exception as exc:  # noqa: BLE001 - keep the original form for this task
+            # Not fatal, but never silent: a solution left inlined gives its abstraction a
+            # usage count of zero, and re-weighting then drives that abstraction's
+            # probability DOWN. That is how the library became actively harmful once before.
+            print(f"  <{task_name}> could not adopt its library form "
+                  f"({type(exc).__name__}: {exc}); keeping the inlined program")
             continue
     return adopted

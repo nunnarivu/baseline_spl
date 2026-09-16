@@ -42,8 +42,9 @@ objects at it. These four calls are the only primitives:
         part of the structure and start a new part from there, instead of shifting all
         the way back one step at a time.
 
-    shift_focus(direction: str)
-        Move the focus along the direction. The focus position will move along the direction and the uncertainity will be updated. 
+    shift_focus(direction: str, num_steps: int = 1)
+        Move the focus num_steps steps along the direction, in one call. The focus position will move along the direction and the uncertainity will be updated
+        (once per call, not once per step). num_steps is a positive integer.
         direction is one of: {DIRECTIONS}
 
     place_object_at_focus(object_id: int)
@@ -140,6 +141,8 @@ OUTPUT_RULES = '''# Output rules
   substructures, key_blocks, actions.
 - construct() must generalize: it takes the numeric argument and works for ANY value of
   it, not only the one shown. never hard-code a fixed number of placements.
+- Do not special-case specific argument values (e.g. `if self.length == 5` or a dict keyed
+  on lengths): write the general rule that holds for every value.
 '''
 
 
@@ -175,8 +178,10 @@ def build_library_block(concept_library) -> str:
             "instantiate it and call its construct() from inside your construct(), instead "
             "of re-deriving the same placements block by block. Call it exactly as shown, "
             "pass it the objects it needs, and append the instance to self._substructures "
-            "so the decomposition is recorded. Place blocks directly only for the parts no "
-            "library concept covers.\n")
+            "so the decomposition is recorded. Add the blocks it placed to your own blocks "
+            "too: blocks lists every object construct() placed, including those placed by "
+            "substructures, never simply the objects passed in. Place blocks directly only "
+            "for the parts no library concept covers.\n")
 
 
 def build_task_block(demo_specs) -> str:
@@ -232,6 +237,8 @@ NO_SKETCH_RULES = '''# Output rules
   substructures, key_blocks, actions.
 - construct() must generalize: it takes the numeric argument and works for ANY value of
   it, not only the ones demonstrated. Never hard-code a fixed number of placements.
+- Do not special-case specific argument values (e.g. `if self.length == 5` or a dict keyed
+  on lengths): write the general rule that holds for every value.
 '''
 
 
@@ -257,7 +264,7 @@ def build_system_prompt(stats_block: str = "", require_signature: bool = True,
         # Conditional, because with an empty library it would point at nothing.
         rules += ("- Reuse the library concepts listed above wherever this structure "
                   "contains one, instead of re-deriving their placements; record each "
-                  "instance you build in substructures.\n")
+                  "instance you build in substructures and its blocks in blocks.\n")
     return (
         "You write Python classes that construct spatial block structures for a robot.\n\n"
         f"{DSL_DOC}\n"

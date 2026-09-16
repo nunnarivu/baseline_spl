@@ -146,7 +146,8 @@ def main() -> int:
     # SPL's own library must be refused even when explicitly asked for.
     from SPL.config.spl_config import SPLConfig as _SPLConfig
     try:
-        assert_not_spl_library(_SPLConfig.load_concept_checkpoint)
+        # load_concept_checkpoint is None when SPL learns from scratch; its save path is still SPL's library.
+        assert_not_spl_library(_SPLConfig.load_concept_checkpoint or _SPLConfig.concept_save_path)
         failures.append("assert_not_spl_library accepted SPL's own concept library")
     except ValueError:
         print("  OK   resuming from SPL's own library is refused")

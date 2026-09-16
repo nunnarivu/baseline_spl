@@ -187,3 +187,61 @@ def test_every_unit_is_searched_when_units_outnumber_workers():
     assert len(searched) >= len(names) // 2, (
         f"only {len(searched)}/{len(names)} tasks produced any result with 2 workers; "
         f"later units were starved of time")
+
+
+def test_enumerate_unit_finds_a_known_program():
+    '''`_enumerate_unit` is what every worker actually runs, and until now no test called it.
+
+    That gap is why its argument list was a hazard: it took a bare 9-tuple whose fields
+    included both a duration (`slice_seconds`) and an absolute timestamp (`hard_deadline`).
+    Swapping those two positionally makes every unit expire the moment it starts and report
+    its tasks unsolved with nothing enumerated -- no exception, no failing test, just a run
+    that quietly finds nothing.
+    '''
+    import time
+
+    from baseline_spl.symbolic import ir, oracles
+    from baseline_spl.symbolic.bridge import grammar
+    from baseline_spl.symbolic.search import EnumerationJob, SearchTask, _enumerate_unit
+
+    task = SearchTask(name="row",
+                      examples=[(n, ir.positions(oracles.ORACLES["row"], n)) for n in (3, 5)])
+    job = EnumerationJob(grammar=grammar("standard"), tasks=[task],
+                         lower=0.0, upper=14.0,
+                         slice_seconds=60.0, hard_deadline=time.time() + 60.0,
+                         soft_frontier=True, evaluator=None, keep=5)
+
+    count, hits, misses = _enumerate_unit(job)
+
+    assert count > 0, "enumerated nothing at all"
+    assert "row" in hits, f"row not solved in {count} programs; hits={list(hits)}"
+    prior, source, distance = hits["row"][0]
+    assert distance == 0.0 and "loop" in source
+
+
+def test_enumerate_unit_respects_its_own_slice_not_the_hard_deadline():
+    '''The slice is measured from when the unit starts; the hard deadline only caps it.
+
+    With a generous hard deadline and a tiny slice the unit must stop almost immediately --
+    that is what stops later waves being starved when units outnumber workers.
+    '''
+    import time
+
+    from baseline_spl.symbolic import ir, oracles
+    from baseline_spl.symbolic.bridge import grammar
+    from baseline_spl.symbolic.search import EnumerationJob, SearchTask, _enumerate_unit
+
+    task = SearchTask(name="staircase",
+                      examples=[(n, ir.positions(oracles.ORACLES["staircase"], n))
+                                for n in (3, 4)])
+    job = EnumerationJob(grammar=grammar("standard"), tasks=[task],
+                         lower=0.0, upper=99.0,          # a band it could never finish
+                         slice_seconds=1.0, hard_deadline=time.time() + 600.0,
+                         soft_frontier=True, evaluator=None, keep=5)
+
+    started = time.time()
+    _enumerate_unit(job)
+    elapsed = time.time() - started
+    assert elapsed < 30, (
+        f"unit ran {elapsed:.0f}s on a 1s slice -- it is following the hard deadline instead, "
+        f"which starves every later wave")

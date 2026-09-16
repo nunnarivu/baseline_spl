@@ -7,9 +7,11 @@ This file holds no settings of its own; all knobs live in baseline_spl/config.py
 copied in by ``from_run_config``. What it does own are the fairness invariants, which are
 correctness guarantees rather than knobs:
 
-  * ``load_concept_checkpoint`` may only point inside this run's own directory, so a
-    baseline never inherits the concepts SPL already learned. Pointing it at the
-    baseline's own library is what lets a run resume.
+  * ``load_concept_checkpoint`` and ``concept_save_path`` may only point outside SPL's
+    tree, so a baseline never inherits the concepts SPL already learned and never writes
+    over SPL's library. Pointing the first at a baseline's own library is what resumes a run.
+  * Both are declared on ``BaselineConfig`` rather than inherited: SPLConfig's defaults
+    name SPL's own run directory, so inheriting either is exactly the leak above.
   * The shared SketchAgent gets a per-run cache directory, so no baseline reads a
     signature that was computed with SPL's concept library in context.
   * SPLConfig shares one instance of each sub-config across all config objects, so they
@@ -20,9 +22,10 @@ from __future__ import annotations
 
 import copy
 import os
+import warnings
 from pathlib import Path
 
-from SPL.config.spl_config import SPLConfig, SketchConfig
+from SPL.config.spl_config import GeneralizeConfig, SPLConfig, SketchConfig
 
 BASELINE_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = BASELINE_ROOT / "runs"
@@ -45,16 +48,18 @@ def _public_attrs(cls) -> dict:
 
 def assert_not_spl_library(path) -> None:
     '''Refuse a checkpoint that lives inside the SPL package: loading it would hand the
-    baseline the concepts SPL itself learned. Any path outside SPL is allowed.'''
+    baseline the concepts SPL itself learned, and saving into it would overwrite them.
+    Any path outside SPL is allowed.'''
     import SPL
 
     spl_root = Path(SPL.__file__).resolve().parent
     resolved = Path(path).resolve()
     if spl_root == resolved or spl_root in resolved.parents:
         raise ValueError(
-            f"resume_from points inside SPL's own tree ({path}). A baseline that loads "
-            f"SPL's concept library is not a baseline. Point it at a baseline run under "
-            f"{RUNS_ROOT}, or set resume=False."
+            f"{path} is inside SPL's own tree. A baseline that loads SPL's concept library "
+            f"is not a baseline, and one that saves into it destroys SPL's results. Point "
+            f"load_concept_checkpoint / concept_save_path at a baseline run under {RUNS_ROOT}, "
+            f"or set load_concept_checkpoint = None to start from an empty library."
         )
 
 
@@ -62,7 +67,15 @@ def assert_not_spl_library(path) -> None:
 # Kept here rather than in the config files: *which* fields must match is machinery, and
 # duplicating the list per config would let it drift between experiments.
 PARITY_CRITICAL = ("concepts", "num_demos_per_concept", "codegen_model",
-                   "vlm_model", "max_code_retries")
+                   "vlm_model", "max_code_retries", "use_evaluator_feedback")
+
+
+#: Parity-critical settings a baseline may opt OUT of by setting them to None, meaning "this
+#: baseline never calls a model". Only the model fields: a baseline that calls no LLM cannot
+#: meaningfully share one, and forcing it to name a model it never uses is what made every
+#: symbolic run stop at the mismatch prompt. Every other field in PARITY_CRITICAL stays
+#: mandatory, so `concepts` or `num_demos_per_concept` can never be opted out of.
+OPTIONAL_WHEN_NONE = ("codegen_model", "vlm_model")
 
 
 def assert_parity(run_cfg) -> None:
@@ -70,7 +83,8 @@ def assert_parity(run_cfg) -> None:
     from baseline_spl.config import CommonConfig
 
     violations = [name for name in PARITY_CRITICAL
-                  if getattr(run_cfg, name, None) != getattr(CommonConfig, name, None)]
+                  if not (name in OPTIONAL_WHEN_NONE and getattr(run_cfg, name, None) is None)
+                  and getattr(run_cfg, name, None) != getattr(CommonConfig, name, None)]
     if violations:
         raise ValueError(
             f"{run_cfg.__name__} overrides parity-critical setting(s) {violations}. "
@@ -82,6 +96,13 @@ def assert_parity(run_cfg) -> None:
 class BaselineConfig(SPLConfig):
     '''Instance attributes shadow SPLConfig's class attributes, so nothing here mutates
     the configuration SPL itself uses.'''
+
+    # The concept-library knobs, with SPLConfig's names and meanings but this package's
+    # values. Declared rather than inherited: SPLConfig's defaults point at SPL's own run
+    # directory, so an inherited value would load SPL's concepts and save over its library.
+    load_concept_checkpoint = None   # library to load; None = start from an empty one
+    skip_loading_concepts = ()       # concepts to leave out of that library
+    ignore_learnt_concepts = True    # skip learning concepts the loaded library already has
 
     def __init__(self, run_name: str, **overrides):
         self.run_name = run_name
@@ -98,28 +119,25 @@ class BaselineConfig(SPLConfig):
         self.inference_record_path = str(run_dir / "inference_records")
         self.llm_cache_dir = str(run_dir / "llm_cache")
 
-        self.resume = True
-        self.resume_from = None
-
         for key, value in overrides.items():
             setattr(self, key, value)
 
-        # Resolved after overrides, since it depends on resume / resume_from.
-        self.load_concept_checkpoint = self._resolve_checkpoint()
+        # Checked after overrides, since the run config is what names a checkpoint. Both
+        # directions: loading SPL's library leaks its concepts in, saving into it destroys them.
+        if self.load_concept_checkpoint:
+            assert_not_spl_library(self.load_concept_checkpoint)
+            if not os.path.exists(self.load_concept_checkpoint):
+                raise FileNotFoundError(
+                    f"load_concept_checkpoint = {self.load_concept_checkpoint} does not exist. "
+                    f"Set it to None to start from an empty library.")
+            self.load_concept_checkpoint = str(self.load_concept_checkpoint)
+        else:
+            self.load_concept_checkpoint = None
+        assert_not_spl_library(self.concept_save_path)
 
         os.makedirs(self.sketch_config.cache_dir, exist_ok=True)
         os.makedirs(self.llm_cache_dir, exist_ok=True)
         os.makedirs(run_dir, exist_ok=True)
-
-    def _resolve_checkpoint(self):
-        '''Which concept library to load, or None to start empty.'''
-        if not self.resume:
-            return None
-        path = self.resume_from or self.concept_save_path
-        if not os.path.exists(path):
-            return None
-        assert_not_spl_library(path)
-        return str(path)
 
     @classmethod
     def from_run_config(cls, run_cfg, run_name: str) -> "BaselineConfig":
@@ -129,13 +147,35 @@ class BaselineConfig(SPLConfig):
         expects under a different name are mapped onto it.
         '''
         assert_parity(run_cfg)
+        # Baselines and SPL's Generalize stage must write code with the same model, or the
+        # results compare models instead of methods. A mismatch can be deliberate, so ask.
+        spl_model = GeneralizeConfig.llm_model
+        # None means "calls no model" (B3-a enumerates; it never prompts an LLM), so it is not a
+        # mismatch and must not raise the question. Without this the baseline that uses no model
+        # at all was the one most reliably stopped by the model prompt.
+        mismatched = {name: getattr(run_cfg, name) for name in ("codegen_model", "vlm_model")
+                      if getattr(run_cfg, name) is not None
+                      and getattr(run_cfg, name) != spl_model}
+        if mismatched:
+            warnings.warn(f"{run_cfg.__name__} uses {mismatched}, but SPL's GeneralizeConfig.llm_model "
+                          f"is {spl_model!r}: the results would compare models, not methods.")
+            try:
+                answer = input("Type yes to continue with these models: ")
+            except (EOFError, OSError):   # no terminal to answer from (background run, pytest)
+                answer = ""
+            if answer.strip().lower() != "yes":
+                raise RuntimeError(f"Stopped: set codegen_model / vlm_model to {spl_model!r}, "
+                                   f"or type yes to run with {mismatched}.")
         settings = _public_attrs(run_cfg)
         settings.pop("run_name", None)   # resolved by the caller and passed explicitly
         configs = cls(run_name, **settings)
 
         configs.concepts_to_learn = list(run_cfg.concepts)
         configs.concepts_to_infer = list(run_cfg.concepts)
-        configs.generalize_config.llm_model = run_cfg.codegen_model
+        # Only when the baseline names one: assigning None here would blank a working model on
+        # the deep-copied Generalize config, and the sketch agent would fail later, far from here.
+        if run_cfg.codegen_model is not None:
+            configs.generalize_config.llm_model = run_cfg.codegen_model
         return configs
 
     def __repr__(self):

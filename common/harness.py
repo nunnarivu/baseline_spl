@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from typing import Any, Dict, List
 
 import numpy as np
@@ -56,10 +56,21 @@ class BaselineHarness:
         from baseline_spl.common.config import assert_not_spl_library
         from baseline_spl.common.sketch import SharedSketch
 
-        # SPL.__init__ loads load_concept_checkpoint for us; config resolved it from
-        # resume / resume_from. Re-check here so no caller can bypass the invariant.
+        # SPL.__init__ loads load_concept_checkpoint for us, minus skip_loading_concepts.
+        # Re-check both paths here so no caller can bypass the invariant by building a
+        # config object directly.
         if configs.load_concept_checkpoint:
             assert_not_spl_library(configs.load_concept_checkpoint)
+        assert_not_spl_library(configs.concept_save_path)
+        # The evaluator runs each class on the demos with their sketched arguments. SayCan
+        # generates no class, so it is not checked.
+        if getattr(configs, "use_evaluator_feedback", False) and hasattr(agent, "generate"):
+            if configs.sketch_mode == "none":
+                raise ValueError("use_evaluator_feedback needs each demo's arguments before the class is "
+                                 "registered, but sketch_mode='none' sketches only afterwards.")
+            if not getattr(configs, "use_demo", True):
+                raise ValueError("use_evaluator_feedback runs the class on the demonstrations, so "
+                                 "use_demo=False would no longer be the instruction-only control.")
 
         self.configs = configs
         self.spl = SPL(configs)
@@ -68,19 +79,27 @@ class BaselineHarness:
 
         self.learned = list(self.spl.concept_library.inductive_concepts)
         if self.learned:
-            log(f"Resumed from {configs.load_concept_checkpoint} with {self.learned}")
-        elif configs.resume:
-            log("Nothing to resume from; starting with an empty concept library.")
-        elif os.path.exists(configs.concept_save_path):
-            log(f"WARNING: resume=False and {configs.concept_save_path} exists. "
-                f"This run will OVERWRITE it and the metric files in {configs.run_dir}.")
+            log(f"Loaded {configs.load_concept_checkpoint} with {self.learned}")
+        elif configs.load_concept_checkpoint:
+            log(f"{configs.load_concept_checkpoint} holds no concept to load "
+                f"(skip_loading_concepts={list(configs.skip_loading_concepts)}).")
+        elif getattr(configs, "learn", True) and os.path.exists(configs.concept_save_path):
+            # Only when this run learns: an inference-only run writes no library, so the same
+            # message there would be a false alarm on every rerun of a finished experiment.
+            log(f"WARNING: load_concept_checkpoint is None and {configs.concept_save_path} "
+                f"exists. This run will OVERWRITE it and the metric files in {configs.run_dir}.")
 
         self._records_path = os.path.join(configs.run_dir, "training_metrics.json")
         self._times_path = os.path.join(configs.run_dir, "learning_times.json")
-        # Merge with previous results when resuming, otherwise a second invocation
-        # truncates the metric files to only the concepts it happened to learn.
-        self._metric_records = self._load_records(self._records_path) if configs.resume else {}
-        self._time_records = self._load_records(self._times_path) if configs.resume else {}
+        # Read unconditionally and prune to the library, as SPL does. Merging is what keeps a
+        # second invocation from truncating the files to the concepts it happened to learn;
+        # pruning is what keeps them describing the library that is actually loaded, so a
+        # concept left out by skip_loading_concepts carries no stale timing and leaves no gap
+        # in `order`. With load_concept_checkpoint=None the library is empty, so both start empty
+        # and the run rewrites them — the warning above says so.
+        self._metric_records = self._prune_to_library(self._load_records(self._records_path))
+        self._time_records = self._prune_to_library(self._load_records(self._times_path),
+                                                    reindex=True)
 
     @staticmethod
     def _load_records(path: str) -> Dict[str, dict]:
@@ -92,6 +111,24 @@ class BaselineHarness:
         except Exception as exc:  # noqa: BLE001
             log(f"Could not read {os.path.basename(path)} ({exc}); starting fresh.")
             return {}
+
+    def _prune_to_library(self, records: Dict[str, dict], *, reindex: bool = False) -> Dict[str, dict]:
+        '''Keep the records whose concept is in the loaded library.
+
+        Records are keyed by the DATASET's concept, but with sketch_mode='none' the library
+        holds the name the model invented, so `pred_concept` counts as being in it too.
+        `reindex` renumbers `order` densely (0..n-1, relative order kept) so a dropped concept
+        leaves no gap and a newly learned one continues collision-free from len(records) —
+        SPL._load_learning_times does the same for the same reason.
+        '''
+        loaded = set(self.spl.concept_library.inductive_concepts)
+        kept = sorted((r for concept, r in records.items()
+                       if concept in loaded or r.get("pred_concept") in loaded),
+                      key=lambda r: r.get("order", 0))
+        if reindex:
+            for order, record in enumerate(kept):
+                record["order"] = order
+        return {r["concept"]: r for r in kept}
 
     # ------------------------------------------------------------------ #
     # Learning
@@ -110,7 +147,7 @@ class BaselineHarness:
             # the class is in the library for the sketch agent to ground against.
             sketch_infos = None
         else:
-            sketch_infos = [self.shared_sketch.signature(d["language_instruction"])
+            sketch_infos = [self.shared_sketch.signature(d["language_instruction"], d)
                             for d in demos]
             sketch_infos = self.shared_sketch.corrected(sketch_infos, demos)
         t_sketch = time.perf_counter() - t0
@@ -141,7 +178,7 @@ class BaselineHarness:
             # Ground each instruction onto the class we just registered. Demonstrations
             # that will not ground are dropped with a warning rather than failing the run.
             t0 = time.perf_counter()
-            grounded = [(self.shared_sketch.ground(d["language_instruction"], concept_name,
+            grounded = [(self.shared_sketch.ground(d["language_instruction"], d, concept_name,
                                                    generated.attributes, log=log), d)
                         for d in demos]
             t_sketch += time.perf_counter() - t0
@@ -159,6 +196,17 @@ class BaselineHarness:
         if sketch_infos and getattr(self.configs.evaluation_config, "evaluate_metrics", True):
             try:
                 metrics = self.spl._evaluate_training_metrics(sketch_infos, demos)
+                def display_metric(name, precision):
+                    value = metrics.get(name)
+                    return "n/a" if value is None else format(value, precision)
+
+                log(f"Metrics <{concept_name}>: "
+                    f"final_mse={display_metric('final_state_mse', '.5f')} "
+                    f"step_mse={display_metric('per_step_mse', '.5f')} "
+                    f"iou={display_metric('mean_iou', '.4f')} "
+                    f"plan_acc={display_metric('plan_accuracy', '.4f')} "
+                    f"plan_len={display_metric('plan_length', '.3f')} "
+                    f"program_acc={display_metric('program_accuracy', '.4f')}")
             except Exception as exc:  # noqa: BLE001
                 log(f"Training-metric evaluation failed for <{concept_name}>: {exc}")
                 status = f"metrics_failed: {exc}"
@@ -168,6 +216,8 @@ class BaselineHarness:
         # model invented the name, i.e. sketch_mode="none". infer_all records both too.
         record = {"concept": gt_concept, "pred_concept": concept_name,
                   "status": status, **metrics}
+        if "evaluator" in generated.info:   # calls, passed, best_score (use_evaluator_feedback)
+            record["evaluator"] = generated.info["evaluator"]
         self._metric_records[gt_concept] = record
 
         self._time_records[gt_concept] = {
@@ -188,44 +238,41 @@ class BaselineHarness:
 
     def learn_all(self) -> None:
         '''Mirrors pipelines/learn_spl_concept.py:learn_spl_concept.'''
-        from SPL.dataloader.datasets import build_inductive_structure_dataloader
+        from SPL.dataloader.datasets import iter_concept_demos
 
         cfg = self.configs
         concepts = list(cfg.concepts_to_learn or cfg.concepts_space)
         log("Attempting to learn: " + ", ".join(concepts))
 
-        dataloader = build_inductive_structure_dataloader(
-            cfg.dataset_name, cfg.train_dataset_dir, cfg.assets_dir,
-            camera_view='fixed_robot_diag_45', batch_size=1,
-            num_workers=getattr(cfg, "num_workers", 4), shuffle=False,
-            load_images=True, load_only=concepts,
-        )
+        # Already in the library, as learn_spl_concept decides it with the same flag: the
+        # library is the only source, and names are matched as-is, so a concept the model
+        # registered under an invented name (sketch_mode="none") is not recognised and gets
+        # relearned. With the flag off a loaded concept is relearned and
+        # register_inductive_concepts raises, exactly as in SPL — drop it from the library
+        # first with skip_loading_concepts.
+        pending = []
+        for concept in concepts:
+            if cfg.ignore_learnt_concepts and concept in self.spl.concept_library.inductive_concepts:
+                log(f"<{concept}> already learned; skipping.")
+            else:
+                pending.append(concept)
 
-        demos_by_concept = OrderedDict({c: [] for c in concepts})
-        for batch in tqdm(dataloader, desc="Loading demonstrations", total=len(dataloader)):
-            for data in batch:
-                if data["concept"] in demos_by_concept:
-                    demos_by_concept[data["concept"]].append(data)
-        for concept, demos in demos_by_concept.items():
+        # One concept's demonstrations in memory at a time: the whole dataset does not fit.
+        for concept, demos in iter_concept_demos(
+                cfg.dataset_name, cfg.train_dataset_dir, cfg.assets_dir,
+                camera_view=cfg.camera_view, concepts=pending,
+                num_demos=cfg.num_demos_per_concept, load_images=True):
             if not demos:
                 log(f"No demonstrations found for <{concept}>; skipping.")
                 continue
-            # Already learned by an earlier run. Skipping is required, not just thrifty:
-            # register_inductive_concepts asserts the name is new. Check the metric records
-            # as well as the library, because with sketch_mode="none" the registered name
-            # is the model's invention and need not equal the dataset's concept.
-            if (concept in self.spl.concept_library.inductive_concepts
-                    or concept in self._metric_records):
-                log(f"<{concept}> already learned; skipping.")
-                continue
-            n = min(len(demos), cfg.num_demos_per_concept)
-            log(f"Learning <{concept.upper()}> from {n} demonstration(s).")
+            log(f"Learning <{concept.upper()}> from {len(demos)} demonstration(s).")
             try:
-                self.learn_concept(demos[:n])
+                self.learn_concept(demos)
             except Exception as exc:  # noqa: BLE001
                 log(f"Learning <{concept}> raised: {exc}")
                 self._metric_records[concept] = {"concept": concept, "status": f"error: {exc}"}
                 self._flush()
+            del demos  # release before the next concept is loaded
 
         if cfg.concept_save_path:
             self.spl.save(cfg.concept_save_path)
@@ -250,15 +297,15 @@ class BaselineHarness:
         if not self.spl.concept_library.inductive_concepts:
             raise RuntimeError(
                 "Inference with an empty concept library: nothing has been learned. "
-                "Set learn=True, or resume=True to load "
-                f"{cfg.resume_from or cfg.concept_save_path}."
+                f"Set learn=True, or point load_concept_checkpoint at a learned library "
+                f"such as {cfg.concept_save_path}."
             )
 
         log("Inferring: " + ", ".join(concepts))
 
         dataloader = build_inductive_structure_dataloader(
             cfg.dataset_name, cfg.test_dataset_dir, cfg.assets_dir,
-            camera_view='fixed_robot_diag_45', batch_size=1,
+            camera_view=cfg.camera_view, batch_size=1,
             num_workers=getattr(cfg, "num_workers", 4), shuffle=False,
             load_images=False, load_only=concepts,
         )
@@ -269,7 +316,7 @@ class BaselineHarness:
                 concept, instruction = data["concept"], data["language_instruction"]
                 gt_states = data.get("meshes")
                 try:
-                    sketch_info = self.shared_sketch.signature(instruction)
+                    sketch_info = self.shared_sketch.signature(instruction, data)
                 except Exception as exc:  # noqa: BLE001
                     records.append({"concept": concept, "demo_id": data.get("demo_id"),
                                     "status": f"sketch_failed: {exc}"})
@@ -282,7 +329,14 @@ class BaselineHarness:
                     continue
 
                 try:
-                    anchor_focus = make_focus(mesh_centroid(gt_states[1][0]))
+                    # As in SPL's infer(): start at the block that moved most between keyframes
+                    # 0 and 1 (the first one placed). None lets SPL.execute fall back to a
+                    # configured INIT_FOCUS_INFERENCE.
+                    anchor_focus = None
+                    if cfg.INIT_FOCUS_INFERENCE is None:
+                        first = int(np.argmax([np.linalg.norm(mesh_centroid(a) - mesh_centroid(b))
+                                               for a, b in zip(gt_states[0], gt_states[1])]))
+                        anchor_focus = make_focus(mesh_centroid(gt_states[1][first]))
                     _plan, final_state = self.spl.execute(
                         instruction, gt_states[0], sketch_info, init_focus=anchor_focus)
                 except Exception as exc:  # noqa: BLE001

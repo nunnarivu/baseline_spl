@@ -95,6 +95,64 @@ def test_compression_produces_valid_abstractions():
         abstraction.infer()
 
 
+def _closed_corpus():
+    '''The line concepts as CLOSED programs, as a demo-level run solves them.'''
+    from baseline_spl.symbolic.bridge import DEMO_REQUEST, to_source
+    # `_freeze` already substitutes the parameter everywhere it appears, including inside
+    # arithmetic -- `row` is `loop (n-1)`, so a version that only handled a bare `Param` missed it.
+    from baseline_spl.tests.test_generalise import _freeze as frozen
+
+    corpus, requests = [], {}
+    for i, concept in enumerate(("row", "column", "tower")):
+        n = 3 + i
+        name = f"{concept}_{n}"
+        source = to_source(frozen(ORACLES[concept], n), concept_level=False)
+        corpus.append((name, Program.parse(source)))
+        requests[name] = DEMO_REQUEST
+    return corpus, requests
+
+
+def test_closed_programs_have_finite_mdl():
+    '''Demo-level programs must be scored at their OWN type.
+
+    Scored at the concept-level request a closed program's likelihood is -inf, so `corpus_mdl`
+    returned inf for the baseline AND every candidate; `best_compression`'s `score < best_score`
+    became `inf < inf`, and no abstraction was ever adopted. Both 12-hour demo-level runs
+    learned nothing for this reason while logging only "mean solved MDL now inf".
+    '''
+    from baseline_spl.symbolic.bridge import DEMO_REQUEST
+    from baseline_spl.symbolic.stitch_bridge import corpus_mdl, program_mdl
+
+    base = grammar("standard", int_literals_upto=13)
+    corpus, requests = _closed_corpus()
+
+    for name, program in corpus:
+        wrong = program_mdl(base, program)                       # concept-level default
+        right = program_mdl(base, program, DEMO_REQUEST)
+        assert wrong == float("inf"), (
+            f"{name}: the concept-level request no longer rejects a closed program, so this "
+            f"test has stopped guarding anything")
+        assert right != float("inf"), f"{name}: closed program still scores as unreachable"
+
+    assert corpus_mdl(base, corpus, requests) != float("inf")
+    assert corpus_mdl(base, corpus) == float("inf"), "the default must stay concept-level"
+
+
+def test_reweighting_uses_each_task_own_request():
+    '''With the wrong request every frontier is skipped and the grammar is returned unchanged.'''
+    from baseline_spl.symbolic.stitch_bridge import reweight
+
+    base = grammar("standard", int_literals_upto=13)
+    corpus, requests = _closed_corpus()
+
+    skipped = []
+    unchanged = reweight(base, corpus, 1.0, log=skipped.append)
+    assert unchanged is base, "without requests, closed programs cannot be re-weighted"
+
+    rewritten = reweight(base, corpus, 1.0, log=None, requests=requests)
+    assert rewritten is not base, "re-weighting a closed corpus produced no new grammar"
+
+
 def main() -> int:
     problems, result, deltas = run()
 

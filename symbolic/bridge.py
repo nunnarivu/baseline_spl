@@ -132,8 +132,34 @@ def grammar(level: str = "standard", continuation: bool = True,
     return Grammar.uniform(prims, continuationType=tstate if continuation else None)
 
 
-CONCEPT_REQUEST = arrow(tint, tstate, tstate)
-DEMO_REQUEST = arrow(tstate, tstate)
+def request_for(arity: int):
+    '''The type a program of `arity` integer arguments must have: k x tint, then tstate -> tstate.
+
+    SPL's concepts do not all take one integer: 69 take one, 12 take two, 2 take three and 15
+    take none. Enumerating `rectangle` at `row`'s type would ask for a program that cannot
+    exist, so the request follows the task.
+    '''
+    request = arrow(tstate, tstate)
+    for _ in range(int(arity)):
+        request = arrow(tint, request)
+    return request
+
+
+def arity_of(concept_level) -> int:
+    '''Accept the old boolean or a plain arity.
+
+    `True`/`False` meant "one integer argument" / "closed" everywhere before concepts had more
+    than one, so they keep meaning exactly that and existing callers are unchanged.
+    '''
+    if concept_level is True:
+        return 1
+    if concept_level is False:
+        return 0
+    return int(concept_level)
+
+
+CONCEPT_REQUEST = request_for(1)
+DEMO_REQUEST = request_for(0)
 
 
 # --------------------------------------------------------------------------------------- #
@@ -142,6 +168,16 @@ DEMO_REQUEST = arrow(tstate, tstate)
 
 STATE = "state"
 PARAM = "param"
+
+
+def param_binders(arity: int) -> List:
+    '''de Bruijn binder tags for a program of `arity` integer arguments.
+
+    `(lambda a (lambda b (lambda state ...)))` numbers its body $0=state, $1=b, $2=a, so the
+    arguments appear in REVERSE order after the state. At arity 1 this is `[STATE, ("param", 0)]`,
+    which is what `[STATE, PARAM]` always meant.
+    '''
+    return [STATE] + [(PARAM, i) for i in range(int(arity) - 1, -1, -1)]
 
 
 def _spine(expr) -> Tuple[object, List]:
@@ -170,8 +206,10 @@ def _to_int(expr, binders: List) -> IntExpr:
         if expr.i >= len(binders):
             raise TranslationError(f"free variable ${expr.i}")
         tag = binders[expr.i]
-        if tag == PARAM:
+        if tag == PARAM:                                  # legacy single-argument tag
             return Param()
+        if isinstance(tag, tuple) and tag[0] == PARAM:
+            return Param(tag[1])
         if isinstance(tag, tuple) and tag[0] == "loop":
             return LoopVar(_loop_depth(binders, tag[1]))
         raise TranslationError(f"${expr.i} is {tag}, not an integer")
@@ -253,7 +291,7 @@ def _to_state(expr, binders: List, next_ordinal: int) -> Tuple[Term, int]:
     raise TranslationError(f"{name} does not produce a state")
 
 
-def to_term(program: Union[Program, str], concept_level: bool = True) -> Term:
+def to_term(program: Union[Program, str], concept_level=True) -> Term:
     '''Read a DreamCoder program as a Term. Raises TranslationError if it is not a state chain.
 
     Once the library grows, solutions call invented abstractions (`#(lambda ...)`), which are
@@ -273,18 +311,17 @@ def to_term(program: Union[Program, str], concept_level: bool = True) -> Term:
         return _to_term(inlined, concept_level)
 
 
-def _to_term(program: Program, concept_level: bool) -> Term:
-    if concept_level:
-        if not (isinstance(program, Abstraction) and isinstance(program.body, Abstraction)):
-            raise TranslationError("expected (lambda (lambda ...)) for a concept-level task")
-        binders = [STATE, PARAM]                          # $0 state, $1 the parameter
-        body = program.body.body
-    else:
-        if not isinstance(program, Abstraction):
-            raise TranslationError("expected (lambda ...) for a demo-level task")
-        binders = [STATE]
-        body = program.body
-    term, _ = _to_state(body, binders, 0)
+def _to_term(program: Program, concept_level) -> Term:
+    arity = arity_of(concept_level)
+    # One lambda per integer argument, then one for the state.
+    body = program
+    for depth in range(arity + 1):
+        if not isinstance(body, Abstraction):
+            raise TranslationError(
+                f"expected {arity + 1} nested lambda(s) for a task of arity {arity}; "
+                f"found only {depth}")
+        body = body.body
+    term, _ = _to_state(body, param_binders(arity), 0)
     return term
 
 
@@ -310,7 +347,13 @@ def _int_source(expr: IntExpr, binders: List) -> str:
     if isinstance(expr, Const):
         return _const_source(expr.value)
     if isinstance(expr, Param):
-        return f"${binders.index(PARAM)}"
+        if PARAM in binders:                              # legacy single-argument binders
+            return f"${binders.index(PARAM)}"
+        try:
+            return f"${binders.index((PARAM, expr.index))}"
+        except ValueError:
+            raise TranslationError(
+                f"Param(index={expr.index}) but the task binds no such argument") from None
     if isinstance(expr, LoopVar):
         ordinals = [b[1] for b in binders if isinstance(b, tuple) and b[0] == "loop"]
         if expr.depth >= len(ordinals):
@@ -347,14 +390,12 @@ def _state_source(term: Term, incoming: str, binders: List, ordinal: List[int]) 
     raise TranslationError(f"cannot render {type(term).__name__}")
 
 
-def to_source(term: Term, concept_level: bool = True) -> str:
-    '''Term -> DreamCoder s-expression source.'''
-    if concept_level:
-        body = _state_source(term, "$0", [STATE, PARAM], [0])
-        return f"(lambda (lambda {body}))"
-    body = _state_source(term, "$0", [STATE], [0])
-    return f"(lambda {body})"
+def to_source(term: Term, concept_level=True) -> str:
+    '''Term -> DreamCoder s-expression source. `concept_level` is a bool or a plain arity.'''
+    arity = arity_of(concept_level)
+    body = _state_source(term, "$0", param_binders(arity), [0])
+    return "(lambda " * (arity + 1) + body + ")" * (arity + 1)
 
 
-def from_term(term: Term, concept_level: bool = True) -> Program:
+def from_term(term: Term, concept_level=True) -> Program:
     return Program.parse(to_source(term, concept_level))

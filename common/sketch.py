@@ -28,10 +28,10 @@ class SharedSketch:
         self.spl = spl
         self.agent = spl.sketch_agent
 
-    def signature(self, instruction: str) -> Dict[str, Any]:
-        '''Instruction -> SPL's sketch_info schema:
+    def signature(self, instruction: str, demo: dict) -> Dict[str, Any]:
+        '''Instruction (+ the demonstration whose scene filter() reads) -> SPL's sketch_info schema:
         ``{'concept': str, 'arguments': {name: {'type': str, 'value': Any}}}``.'''
-        return self.agent.extract_function_signature(instruction)
+        return self.agent.extract_function_signature(instruction, demo)
 
     @staticmethod
     def values(sketch_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,7 +52,7 @@ class SharedSketch:
         they already agree.'''
         return self.spl.validate_and_correct_sketch(sketch_infos, demos)
 
-    def ground(self, instruction: str, concept: str, attributes: Dict[str, type],
+    def ground(self, instruction: str, demo: dict, concept: str, attributes: Dict[str, type],
                retries: int = 2, log=print) -> Optional[Dict[str, Any]]:
         '''Sketch an instruction onto an already-registered concept.
 
@@ -73,7 +73,7 @@ class SharedSketch:
         try:
             for attempt in range(retries + 1):
                 try:
-                    info = self.agent.extract_function_signature(instruction)
+                    info = self.agent.extract_function_signature(instruction, demo)
                 except Exception as exc:  # noqa: BLE001
                     problem = f"sketch raised: {exc}"
                 else:
