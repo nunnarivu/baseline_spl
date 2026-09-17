@@ -219,7 +219,7 @@ class LLMBackend:
         # Recorded so a caller can continue this turn as a conversation.
         self.last_response_id = getattr(self.client, "last_response_id", None)
 
-        text, usage = self._extract(response, attempt_endpoint)
+        text, usage = self._extract(response)
         if not text:
             # Reasoning models can spend the whole budget on hidden reasoning tokens and
             # return empty content. Silently caching "" would poison every later run.
@@ -272,7 +272,16 @@ class LLMBackend:
         return None
 
     @staticmethod
-    def _extract(response: Any, endpoint: str) -> Tuple[str, dict]:
+    def _extract(response: Any) -> Tuple[str, dict]:
+        '''Detects the response's actual shape rather than trusting the endpoint label the
+        caller requested: ``Conversation.ask`` always passes "responses" (see its
+        docstring), but qwenClient/googleClient/vertexaiClient have no real Responses-API
+        equivalent and always return a chat-completion-shaped object
+        (``.choices[0].message.content``) regardless of the endpoint they were asked for --
+        and nothing corrects the label back to "chat" once a call succeeds. Trusting the
+        label used to mean every such response was parsed via ``.output_text``/``.output``,
+        which don't exist on a chat-shaped object, silently discarding real answers as
+        "empty content".'''
         usage_obj = getattr(response, "usage", None)
         usage = {}
         if usage_obj is not None:
@@ -282,7 +291,7 @@ class LLMBackend:
                 "completion_tokens": getattr(usage_obj, "completion_tokens", None)
                 or getattr(usage_obj, "output_tokens", 0) or 0,
             }
-        if endpoint == "chat":
+        if hasattr(response, "choices"):
             return (response.choices[0].message.content or "").strip(), usage
         text = getattr(response, "output_text", None)
         if text is None:
