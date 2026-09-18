@@ -24,6 +24,7 @@ import gc
 import json
 import os
 import time
+import yaml
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
@@ -62,6 +63,34 @@ class SearchHarness(BaselineHarness):
         # the same rule the driver accepts by.
         self.evaluator = evaluate.build(configs)
         self.observation_mode = getattr(configs, "observation_mode", "lattice")
+
+        # The two intermediate forms between "search found this" and "this is now a Python
+        # class" -- the raw lambda-calculus program and the IR term `lower` reads -- kept as
+        # their own artifact rather than only in the text log, so they survive a `grep`-free
+        # read and a resumed run doesn't have to re-derive them from a stale log file.
+        # Loaded and pruned the same way `_metric_records`/`_time_records` are (common/harness.py),
+        # so a concept dropped by `skip_loading_concepts` leaves no stale entry behind.
+        self._programs_path = os.path.join(configs.run_dir, "search_programs.yml")
+        self._program_records = self._prune_to_library(self._load_yaml(self._programs_path))
+
+    @staticmethod
+    def _load_yaml(path: str) -> Dict[str, dict]:
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as exc:  # noqa: BLE001
+            log(f"Could not read {os.path.basename(path)} ({exc}); starting fresh.")
+            return {}
+
+    def _record_program(self, concept: str, **fields) -> None:
+        # `_prune_to_library` (common/harness.py) rebuilds its return dict from each record's
+        # OWN "concept" field, not the key it was passed under -- every record needs one.
+        self._program_records[concept] = {"concept": concept, **fields}
+        with open(self._programs_path, "w", encoding="utf-8") as f:
+            yaml.dump(self._program_records, f, allow_unicode=True, sort_keys=False,
+                      default_flow_style=False)
 
     # ------------------------------------------------------------------ #
 
@@ -364,6 +393,7 @@ class SearchHarness(BaselineHarness):
                 recovered[concept] = outcome.term
                 log(f"  <{concept}>: recovered a parameterised class from "
                     f"{len(terms)} solved demo(s) at {params} [{outcome.route}]")
+                log(f"  <{concept}>: recovered IR term = {outcome.term!r}")
             else:
                 log(f"  <{concept}>: no class recovered -- "
                     f"{generalise.REASONS.get(outcome.reason, outcome.reason)}")
@@ -523,6 +553,31 @@ class SearchHarness(BaselineHarness):
         # and encode its keyframes, and both outputs are small (a string and PNG bytes).
         hooks = self._driver_hooks(pending, tasks)
 
+        # Register and save each concept as soon as ITS search is exact, rather than waiting
+        # for driver.run() to finish every iteration. With `search_iterations` in the double
+        # digits and each one hours long, "registration happens once at the very end" meant a
+        # kill anywhere before the LAST iteration lost every concept solved in every earlier
+        # one too -- not just that iteration's work, as the per-concept `self.spl.save()`
+        # inside `learn_concept` might suggest, since that call was never reached until the
+        # whole driver.run() returned.
+        #
+        # Demo-level is out of scope here: what gets registered there is a class RECOVERED by
+        # anti-unifying several demo tasks together (`_recover_concept_classes`), which needs
+        # every one of a concept's demo tasks' outcomes at once, not a single task's.
+        registered_early: set = set()
+        if granularity == "concept":
+            def _register_newly_solved(result, index):
+                newly = [c for c in pending if c not in registered_early
+                        and result.solutions.get(c) is not None and result.solutions[c].exact]
+                if not newly:
+                    return
+                log(f"[iter {index}] registering {len(newly)} newly-solved concept(s) early: "
+                    f"{', '.join(newly)}")
+                subset = OrderedDict((c, pending[c]) for c in newly)
+                self._register_and_score(subset, used_demos, result, tasks, cfg)
+                registered_early.update(newly)
+            hooks["on_iteration"] = _register_newly_solved
+
         # Then let the geometry go, before the wake phase forks its workers. Everything the
         # search needs is already in `tasks`.
         released = self._release_demo_payload(pending)
@@ -608,7 +663,11 @@ class SearchHarness(BaselineHarness):
         # on mesh-less demos -- `program_accuracy` still worked (it compares against
         # `run_gt_program`) while `plan_accuracy`, `mean_iou` and the stability checks all went
         # silently to None.
-        self._register_and_score(pending, used_demos, result, tasks, cfg)
+        #
+        # Excludes whatever `_register_newly_solved` already registered mid-run above --
+        # `registered_early` is empty for demo-level runs, so this is a no-op filter there.
+        remaining = OrderedDict((c, d) for c, d in pending.items() if c not in registered_early)
+        self._register_and_score(remaining, used_demos, result, tasks, cfg)
 
         if cfg.concept_save_path:
             self.spl.save(cfg.concept_save_path)
@@ -641,11 +700,26 @@ class SearchHarness(BaselineHarness):
                     "evaluator": evaluator.name,
                     "program_accuracy": None, "program_verdict": "not_found"}
                 self._flush()
+                self._record_program(
+                    concept, status=status,
+                    program=str(solution.program) if solution and solution.program else None,
+                    term=None)
                 continue
 
             from baseline_spl.symbolic.ir import args as _args
 
             param = next(t for t in tasks if t.name == concept).param_name
+            # The two intermediate forms between "search found this" and "this is now a
+            # class": the raw lambda-calculus program the search/STITCH/recovery produced,
+            # and the IR term `lower` actually reads. Logged before lowering, not after, so a
+            # lowering failure (caught below via `saved_is_exact`, or a crash in `lower`
+            # itself) still leaves a record of what was being lowered.
+            log(f"<{concept}>: solved program (lambda calculus) = {solution.program}")
+            log(f"<{concept}>: IR term = {solution.term!r}")
+            self._record_program(
+                concept, status=solution.status, mdl=round(-solution.log_prior, 2),
+                solved_by=result.solved_by.get(concept),
+                program=str(solution.program), term=repr(solution.term))
             code = lower(solution.term, concept, param)
             exact, why = saved_is_exact(solution.term, arity=len(_args(param)))
             if not exact:

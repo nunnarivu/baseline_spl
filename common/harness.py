@@ -16,6 +16,7 @@ metric JSONs come out in the same shape and diff cleanly against SPL's own runs.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections import defaultdict
@@ -26,7 +27,18 @@ from tqdm import tqdm
 
 
 def log(message: str = "") -> None:
-    print(f"\n[BASELINE] {message}")
+    '''Every baseline's progress narrative -- concepts learnt, search iterations, proposer
+    stats, everything printed with a "[BASELINE]" prefix -- goes through here.
+
+    This used to be a bare `print`, so it only ever reached whatever the terminal happened to
+    be: visible live, but gone the moment the pane closed, and absent from every log file and
+    JSON artifact. SPL's own logger ("SPL", set up in `SPL.__init__` -> `get_logger`, before
+    any baseline code runs) already writes to both the console and
+    `<run_dir>/logs/SPL_<timestamp>.log` -- the same file the "Log file: ..." line already
+    points at. Routing through it, rather than opening a second file, means there is one place
+    to look, and it already exists for every run past and future.
+    '''
+    logging.getLogger("SPL").info("[BASELINE] %s", message)
 
 
 class GeneratedConcept:

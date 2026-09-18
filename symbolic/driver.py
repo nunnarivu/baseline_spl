@@ -151,13 +151,17 @@ class _Loop:
     it is.
     """
 
-    def __init__(self, tasks, settings, evaluator, propose, document, log):
+    def __init__(self, tasks, settings, evaluator, propose, document, log, on_iteration=None):
         self.tasks = list(tasks)
         self.settings = settings
         self.evaluator = evaluator
         self.propose_hook = propose
         self.document_hook = document
         self.log = log
+        # Fires once per completed iteration, so a concept solved in iteration 1 can be
+        # registered and saved to disk immediately rather than waiting for every iteration
+        # (`search_iterations` may be 10+) to finish -- see `on_iteration`'s call site below.
+        self.on_iteration_hook = on_iteration
 
         self.result = RunResult(grammar=build_grammar(
             settings.level, continuation=settings.continuation,
@@ -383,6 +387,12 @@ class _Loop:
             self._reweight(index, report, solved_programs)
 
             self.result.reports.append(report)
+            if self.on_iteration_hook is not None:
+                try:
+                    self.on_iteration_hook(self.result, index)
+                except Exception as exc:  # noqa: BLE001 - registering early must never end the run
+                    self.log(f"[iter {index}] on_iteration hook raised "
+                             f"({type(exc).__name__}: {exc}); continuing.")
             if not report.newly_solved and not report.abstractions:
                 self.log(f"[iter {index}] neither the solutions nor the library changed; "
                          f"stopping.")
@@ -396,7 +406,7 @@ class _Loop:
 
 
 def run(tasks: Sequence[SearchTask], settings: Optional[SearchSettings] = None, *,
-        propose=None, document=None, evaluator=None, log=print) -> RunResult:
+        propose=None, document=None, evaluator=None, log=print, on_iteration=None) -> RunResult:
     '''Search for a program for every task, growing a library as it goes.
 
     `propose` and `document` are B3-b's (LILO's) two additions, and they are the *only*
@@ -410,11 +420,17 @@ def run(tasks: Sequence[SearchTask], settings: Optional[SearchSettings] = None, 
         document(new_abstractions, corpus) -> {str(abstraction): {readable_name, ...}}
             asked after compression accepts abstractions, so the next proposal prompt can
             refer to the library by name rather than by anonymous s-expression.
+
+    `on_iteration(result, index)` runs once per completed iteration, mainly so a caller can
+    register+save newly-solved concepts as they happen instead of waiting for every iteration
+    to finish -- with `settings.iterations` in the double digits and each one hours long,
+    "registration happens once at the very end" meant a kill anywhere before the last
+    iteration lost everything, not just that iteration's work.
     '''
     from baseline_spl.symbolic.search import DEFAULT_EVALUATOR
 
     return _Loop(tasks, settings or SearchSettings(), evaluator or DEFAULT_EVALUATOR,
-                 propose, document, log).run()
+                 propose, document, log, on_iteration=on_iteration).run()
 
 
 def _accept_proposals(result: RunResult, candidates: Dict[str, Sequence[Program]],

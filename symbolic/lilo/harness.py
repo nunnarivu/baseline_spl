@@ -68,38 +68,72 @@ class LiloHarness(SearchHarness):
 
         Failures here are logged and non-fatal: a missing SRN checkpoint or a demo loaded
         without images should cost the run a prompt section, not the run.
+
+        Both channels need real geometry `pending`'s own demos don't carry -- `_load_demos
+        (summarise=True)` stripped every HEAVY_KEY before this hook ever runs, the same strip
+        `_register_and_score` (harness.py) reloads around for scoring. At iteration 0 `pending`
+        is most or all of the concept set, and loading that many concepts' geometry in one shot
+        reproduces the incident documented at `SearchHarness.HEAVY_KEYS`: ~53 GB for 16
+        concepts, three concurrent runs at 231 GB of 251 GB, one OOM-killed with no traceback.
+        So this reloads in `scoring_chunk`-sized windows, releasing each before the next --
+        exactly the pattern `_register_and_score` already uses, not a one-shot load.
         '''
         cfg = self.configs
         modality = getattr(cfg, "demo_modality", "coords")
+        stats_wanted = modality in ("coords", "both") and self.observation_mode == "continuous"
+        stats_enabled = stats_wanted and getattr(cfg, "include_primitive_stats", True)
+        needs_images = modality in ("images", "both")
+        if not (stats_wanted or needs_images):
+            return
 
-        if modality in ("coords", "both") and self.observation_mode == "continuous":
-            from baseline_spl.common.primitive_stats import build_stats_block
+        names = {t.name for t in tasks}
+        concepts_needed = [c for c in pending if c in names]
+        per_demo_stats: list = []
+        attached = 0
 
-            demos = [d for group in pending.values() for d in group]
-            block = build_stats_block(self.spl.executor, demos,
-                                      getattr(cfg, "include_primitive_stats", True))
+        if (stats_enabled or needs_images) and concepts_needed:
+            from baseline_spl.common.primitive_stats import direction_stats
+            from baseline_spl.common.serialize_visual import demo_frames
+
+            chunk = max(1, int(getattr(cfg, "scoring_chunk", 8)))
+            for start in range(0, len(concepts_needed), chunk):
+                window = concepts_needed[start:start + chunk]
+                window_demos = self._load_demos(window, summarise=False)
+
+                if stats_enabled:
+                    demos = [d for group in window_demos.values() for d in group]
+                    try:
+                        per_demo_stats.extend(direction_stats(self.spl.executor, demos))
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"Proposer: shift_focus stats failed on {window} "
+                            f"({type(exc).__name__}: {exc}); skipping this window.")
+
+                if needs_images:
+                    for concept in window:
+                        demos = window_demos.get(concept) or []
+                        try:
+                            frames = []
+                            for demo in demos[:cfg.num_demos_per_concept]:
+                                frames.extend(demo_frames(
+                                    demo, max_px=getattr(cfg, "vlm_max_image_px", 512),
+                                    max_keyframes=getattr(cfg, "vlm_max_keyframes", 40)))
+                            self.proposer.demo_frames[concept] = frames
+                            attached += 1
+                        except Exception as exc:  # noqa: BLE001
+                            log(f"Proposer: no keyframes for <{concept}>: "
+                                f"{type(exc).__name__}: {exc}")
+
+                window_demos = None    # let this window's meshes/images go before the next
+                self._reclaim()
+
+        if stats_wanted:
+            from baseline_spl.common.primitive_stats import render_stats_block
+
+            block = render_stats_block(per_demo_stats) if stats_enabled else ""
             self.proposer.stats_block = block
             log(f"Proposer: {'attached' if block else 'no'} shift_focus delta table")
 
-        if modality in ("images", "both"):
-            from baseline_spl.common.serialize_visual import demo_frames
-
-            names = {t.name for t in tasks}
-            attached = 0
-            for concept, demos in pending.items():
-                if concept not in names:
-                    continue
-                try:
-                    frames = []
-                    for demo in demos[:cfg.num_demos_per_concept]:
-                        frames.extend(demo_frames(
-                            demo, max_px=getattr(cfg, "vlm_max_image_px", 512),
-                            max_keyframes=getattr(cfg, "vlm_max_keyframes", 40)))
-                    self.proposer.demo_frames[concept] = frames
-                    attached += 1
-                except Exception as exc:  # noqa: BLE001
-                    log(f"Proposer: no keyframes for <{concept}>: "
-                        f"{type(exc).__name__}: {exc}")
+        if needs_images:
             log(f"Proposer: attached keyframes for {attached} concept(s)")
 
     def _after_run(self, result) -> None:

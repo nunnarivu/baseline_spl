@@ -119,7 +119,7 @@ class CodeAsPoliciesAgent:
             self.backend, system_prompt, user_prompt,
             wanted_name=concept,
             max_retries=self.configs.max_code_retries,
-            max_tokens=self.configs.codegen_max_tokens,
+            max_tokens=getattr(self.configs, "codegen_max_tokens", 200000),
             images=images,
             evaluator=evaluator,
             log=log,

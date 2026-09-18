@@ -42,10 +42,15 @@ class CommonConfig:
     # OpenAI processing tier for every LLM/VLM call.
     #   'flex'    : cheaper, but requests queue and can take much longer
     #   'default' : standard processing
-    service_tier = "flex"
+    service_tier = "default"
 
     # Retries per concept class, shared by parse failures and (below) evaluation failures.
     max_code_retries = 3
+
+    # Completion budget for codegen.generate_with_retries and call_vlm. See default.py's
+    # copy of this field for the full rationale (reasoning models can spend the whole
+    # budget on hidden reasoning and return empty content if cut off before answering).
+    codegen_max_tokens = 100000
 
     # Run each generated class on the demonstrations and retry with a report (crash, block
     # count, per-block distance to the demo's final state, bookkeeping), as SPL's Generalize
@@ -80,7 +85,7 @@ class CommonConfig:
 
     # Output directory under runs/. None means use the config file's own name, so two
     # configs can never overwrite each other's results.
-    run_name = "cap_plus_plus_run1"
+    run_name = "cap_plus_plus_gptluna_run3"
 
 
 class CapConfig(CommonConfig):
@@ -99,7 +104,7 @@ class CapConfig(CommonConfig):
 
     # Depth limit for CaP's recursive generation of helpers the code calls but
     # never defines.
-    max_expansion_depth = 2
+    max_expansion_depth = 3
 
 
 class Demo2CodeConfig(CommonConfig):
