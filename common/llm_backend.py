@@ -185,13 +185,14 @@ class LLMBackend:
 
         attempt_params = dict(params)
         attempt_endpoint = endpoint
+        attempt_images = list(images) if images else None
         last_exc = None
         for _ in range(8):  # each round fixes at most one incompatibility
             try:
                 response = self.client.generate_response(
                     messages=messages,
                     model=model,
-                    images=list(images) if images else None,
+                    images=attempt_images,
                     previous_response_id=previous_response_id,
                     endpoint=attempt_endpoint,
                     return_raw=True,
@@ -201,6 +202,15 @@ class LLMBackend:
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 message = str(exc)
+
+                # Token limit exceeded: drop images by subsampling
+                if attempt_images and self._is_token_limit_error(message):
+                    old_count = len(attempt_images)
+                    attempt_images = self._subsample_images(attempt_images)
+                    warnings.warn(f"[LLMBackend] Token limit exceeded ({old_count} images). "
+                                  f"Subsampling to {len(attempt_images)} images and retrying.")
+                    continue
+
                 # Some models (e.g. the *-codex family) are Responses-only, while
                 # upstream Demo2Code is written against chat completions. Switch rather
                 # than forcing the caller to know which family a model belongs to.
@@ -298,10 +308,45 @@ class LLMBackend:
             chunks = []
             for item in getattr(response, "output", []) or []:
                 for content in getattr(item, "content", []) or []:
-                    if getattr(content, "text", None):
-                        chunks.append(content.text)
+                    if isinstance(content, str):
+                        chunks.append(content)
             text = "".join(chunks)
-        return (text or "").strip(), usage
+        return text.strip(), usage
+
+    @staticmethod
+    def _is_token_limit_error(message: str) -> bool:
+        lowered = message.lower()
+        if "unsupported" in lowered or "not supported" in lowered or "unrecognized" in lowered:
+            return False
+        patterns = (
+            "exceeds the maximum number of tokens",
+            "maximum context length",
+            "context_length_exceeded",
+            "input token count exceeds",
+            "token limit",
+            "prompt is too long",
+            "too many tokens",
+            "tokens exceed",
+            "token count exceeds",
+            "exceeds token limit",
+            "max tokens allowed",
+            "maximum number of tokens allowed",
+        )
+        return any(p in lowered for p in patterns)
+
+    @staticmethod
+    def _subsample_images(images: Sequence[Any]) -> List[Any]:
+        '''Downsample keyframe images by dropping intermediate frames, preserving first and last.'''
+        if not images or len(images) <= 1:
+            return []
+        new_count = max(1, len(images) // 2)
+        if new_count == 1:
+            return [images[-1]]
+        step = (len(images) - 1) / (new_count - 1)
+        indices = sorted(set(int(round(i * step)) for i in range(new_count)))
+        if len(indices) >= len(images):
+            indices = indices[:max(1, len(images) - 1)]
+        return [images[i] for i in indices]
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -381,17 +426,25 @@ class LLMBackend:
             return list(texts) if texts is not None else [entry["text"]]
 
         attempt = dict(params)
+        attempt_images = list(images) if images else None
         last_exc = None
         for _ in range(8):
             try:
                 response = self.client.generate_response(
                     messages=messages, model=model, endpoint="chat",
-                    images=list(images) if images else None,
+                    images=attempt_images,
                     return_raw=True, **attempt)
                 break
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                dropped = self._strip_rejected_param(attempt, str(exc))
+                message = str(exc)
+                if attempt_images and self._is_token_limit_error(message):
+                    old_count = len(attempt_images)
+                    attempt_images = self._subsample_images(attempt_images)
+                    warnings.warn(f"[LLMBackend] Token limit exceeded ({old_count} images). "
+                                  f"Subsampling to {len(attempt_images)} images and retrying.")
+                    continue
+                dropped = self._strip_rejected_param(attempt, message)
                 if dropped is None:
                     raise
                 warnings.warn(f"[LLMBackend] {model} rejected '{dropped}'; retrying without it.")
