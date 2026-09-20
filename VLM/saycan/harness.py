@@ -200,10 +200,12 @@ class SayCanHarness(BaselineHarness):
         for concept, wanted in iter_concept_demos(
                 cfg.dataset_name, cfg.train_dataset_dir, cfg.assets_dir,
                 camera_view=cfg.camera_view, concepts=concepts,
-                num_demos=cfg.num_demos_per_concept, load_images=True):
+                num_demos=cfg.num_demos_per_concept, load_images=True,
+                selection=getattr(cfg, "demo_selection", "first")):
             if not wanted:
                 log(f"No demonstrations found for <{concept}>; skipping.")
                 continue
+            self._record_demo_selection(concept, wanted)
             n = len(wanted)
             missing = self._missing_demos(concept, wanted)
             if not missing:

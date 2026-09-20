@@ -274,10 +274,14 @@ class BaselineHarness:
         for concept, demos in iter_concept_demos(
                 cfg.dataset_name, cfg.train_dataset_dir, cfg.assets_dir,
                 camera_view=cfg.camera_view, concepts=pending,
-                num_demos=cfg.num_demos_per_concept, load_images=True):
+                num_demos=cfg.num_demos_per_concept, load_images=True,
+                # SPL's own demo choice (BaselineConfig inherits SPLConfig.demo_selection),
+                # so the baseline learns from the same demos SPL does.
+                selection=getattr(cfg, "demo_selection", "first")):
             if not demos:
                 log(f"No demonstrations found for <{concept}>; skipping.")
                 continue
+            self._record_demo_selection(concept, demos)
             log(f"Learning <{concept.upper()}> from {len(demos)} demonstration(s).")
             try:
                 self.learn_concept(demos)
@@ -469,6 +473,21 @@ class BaselineHarness:
         log(f"Statuses: {dict(status_counts)}")
 
     # ------------------------------------------------------------------ #
+    def _record_demo_selection(self, concept: str, demos) -> None:
+        '''Write the ids of the demos a concept learns from to demo_selection.json, the file
+        the symbolic baselines already write. recompute_metrics reads it to score exactly the
+        demos the run used, whatever demo_selection was when it ran. Merged with any existing
+        file so a resumed run keeps the concepts it learned earlier.'''
+        path = os.path.join(self.configs.run_dir, "demo_selection.json")
+        recorded = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                recorded = json.load(f)
+        recorded[concept] = [str(demo.get("demo_id")) for demo in demos]
+        os.makedirs(self.configs.run_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(recorded, f, indent=2)
+
     def _flush(self) -> None:
         os.makedirs(self.configs.run_dir, exist_ok=True)
         with open(self._records_path, "w", encoding="utf-8") as f:
