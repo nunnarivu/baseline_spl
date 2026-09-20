@@ -19,17 +19,22 @@ Run: python -m baseline_spl.tests.test_tasks
 
 from __future__ import annotations
 
+import gc
 import glob
 import json
 import os
 from collections import defaultdict
 
-from SPL.config.spl_config import ORIGINAL_CONCEPTS
+from SPL.config.spl_config import ALL_CONCEPTS
 from SPL.utils.metrics import run_gt_program
-from baseline_spl.symbolic.tasks import (_parameter, demo_cells, global_pitch,
+from baseline_spl.common.serialize_text import _lattice
+from baseline_spl.symbolic.tasks import (_parameter, demo_deltas, pitch_from_deltas,
                                          select_demos)
 
-DATA_DIR = "DATA/structures"
+# The live dataset. `DATA/structures` was the frozen 16-concept set and no longer exists, so
+# this check had been failing with a FileNotFoundError rather than checking anything -- for
+# the whole period in which a term/program defect went unnoticed.
+DATA_DIR = "DATA/new_data"
 
 
 def load_demo_metadata():
@@ -38,11 +43,13 @@ def load_demo_metadata():
     for path in sorted(glob.glob(os.path.join(DATA_DIR, "*", "demo.json"))):
         j = json.load(open(path))
         concept = j.get("concept")
-        if concept not in ORIGINAL_CONCEPTS:
+        if concept not in ALL_CONCEPTS:
             continue
         grouped[concept].append((
             os.path.basename(os.path.dirname(path)),
-            j["initializations"]["__param_0__"],
+            # `.get`: 15 of the 99 concepts are fixed-size and carry no parameter at all.
+            # Indexing blindly here is what limited this check to the parameterised concepts.
+            j["initializations"].get("__param_0__"),
             j["program"],
             len(j["scene_info"]["object_ids"]),
         ))
@@ -65,45 +72,96 @@ def load_demos(concepts):
     return grouped
 
 
+def normalise(cells):
+    '''Placements re-expressed with the first one at the origin. See the note in
+    `check_conversion`, and `tests/test_term_fidelity.normalise`, which does the same for
+    terms.'''
+    cells = [tuple(c) for c in cells]
+    if not cells:
+        return cells
+    first = cells[0]
+    return [tuple(c[i] - first[i] for i in range(3)) for c in cells]
+
+
+# Concepts whose demonstrations are held in memory at once. The geometry is what costs:
+# loading all 99 concepts' meshes in one pass reached 171 GB of 251 GB before being killed,
+# which is the same blow-up `SearchHarness.HEAVY_KEYS` exists to avoid. Only the placement
+# deltas are kept per demo -- a handful of 3-vectors -- so the peak is one chunk regardless of
+# how large the dataset grows.
+LOAD_CHUNK = 8
+
+
+def collect_deltas(concepts):
+    '''(concept, demo_id) -> placement deltas, loading the geometry a chunk at a time.'''
+    deltas = {}
+    for start in range(0, len(concepts), LOAD_CHUNK):
+        window = concepts[start:start + LOAD_CHUNK]
+        loaded = load_demos(window)
+        for concept, group in loaded.items():
+            for demo in group:
+                deltas[(concept, str(demo.get("demo_id")))] = demo_deltas(demo)
+        loaded = None
+        gc.collect()
+    return deltas
+
+
 def check_conversion(concepts):
     '''Returns {label: reason} for demos whose keyframe cells disagree with ground truth.'''
+    import numpy as np
+
     metadata = load_demo_metadata()
-    demos = load_demos(concepts)
-    # One pitch for the whole run, exactly as build_tasks does. Per-concept estimation is
-    # wrong for pins -- see tasks.global_pitch.
-    pitch = global_pitch([d for group in demos.values() for d in group])
+    concepts = list(concepts)
+    deltas = collect_deltas(concepts)
+    # One pitch for the whole set, exactly as build_tasks does -- per-concept estimation is
+    # wrong for pins (see tasks.global_pitch). `pitch_from_deltas` is the same statistic
+    # `global_pitch` uses once geometry has been released, so chunking changes nothing here.
+    pitch = pitch_from_deltas(list(deltas.values()))
+    zero = np.zeros(3)
     problems = {}
     checked = 0
     for concept in concepts:
         by_id = {d: (p, prog, n) for d, p, prog, n in metadata.get(concept, [])}
-        for demo in demos.get(concept, []):
-            demo_id = str(demo.get("demo_id"))
-            if demo_id not in by_id:
+        for demo_id, (_param, program, num_objects) in by_id.items():
+            if (concept, demo_id) not in deltas:
                 continue
-            _param, program, num_objects = by_id[demo_id]
             gt = run_gt_program(program, num_objects)
             if gt is None:
                 problems[f"{concept}/{demo_id}"] = "ground truth failed to run"
                 continue
             try:
-                cells = demo_cells(demo, pitch)
+                cells = [_lattice(delta, zero, pitch)
+                         for delta in deltas[(concept, demo_id)]]
             except Exception as exc:  # noqa: BLE001
-                problems[f"{concept}/{demo_id}"] = f"demo_cells raised: {exc}"
+                problems[f"{concept}/{demo_id}"] = f"cell conversion raised: {exc}"
                 continue
             checked += 1
-            if cells != gt["positions"]:
-                first = next((i for i, (a, b) in enumerate(zip(cells, gt["positions"]))
-                              if a != b), min(len(cells), len(gt["positions"])))
+            # Both sides re-expressed with their own first placement at the origin. The demo
+            # counts from the first block PLACED; `run_gt_program` counts from where the focus
+            # STARTED, and those differ by whatever the program shifts before placing anything.
+            # `rocket` and `tree` open with `for i in range(2): shift_focus('right')`, so they
+            # come out uniformly translated by (0, 2, 0) while being the same shape. A
+            # translation is not drift; a different shape is.
+            ours, theirs = normalise(cells), normalise(gt["positions"])
+            if ours != theirs:
+                first = next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b),
+                             min(len(ours), len(theirs)))
                 problems[f"{concept}/{demo_id}"] = (
-                    f"{len(cells)} cells vs {len(gt['positions'])}, first differs at {first}: "
-                    f"keyframes {cells[first:first + 2]} vs gt {gt['positions'][first:first + 2]}")
+                    f"{len(ours)} cells vs {len(theirs)}, first differs at {first}: "
+                    f"keyframes {ours[first:first + 2]} vs gt {theirs[first:first + 2]}")
     return problems, checked
 
 
 # ----------------------------------------------------------------------------------- #
 
 def test_keyframe_cells_match_ground_truth():
-    problems, checked = check_conversion(sorted(ORIGINAL_CONCEPTS))
+    '''Every concept in the dataset, not the 16 this used to cover.
+
+    The search's target comes from the keyframes, never from `demo.json:program`, so a demo
+    whose keyframes disagree with its own generating program sends the search after the wrong
+    structure and every downstream number is quietly wrong for that concept. Checking all of
+    them is what makes that detectable for concepts added to the dataset later.
+    '''
+    problems, checked = check_conversion(sorted(ALL_CONCEPTS))
     assert checked, "no demos were checked"
     assert not problems, "\n".join(f"{k}: {v}" for k, v in problems.items())
 
@@ -165,8 +223,8 @@ def main() -> int:
     print("  OK\n")
 
     print("keyframes -> lattice cells, cross-checked against ground truth")
-    problems, checked = check_conversion(sorted(ORIGINAL_CONCEPTS))
-    print(f"  checked {checked} demos across {len(ORIGINAL_CONCEPTS)} concepts")
+    problems, checked = check_conversion(sorted(ALL_CONCEPTS))
+    print(f"  checked {checked} demos across {len(ALL_CONCEPTS)} concepts")
     if problems:
         print(f"\n{len(problems)} MISMATCH(ES):")
         for label, why in sorted(problems.items()):

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from baseline_spl.symbolic._dreamcoder import Grammar, Invented, Program
-from baseline_spl.symbolic.bridge import CONCEPT_REQUEST, grammar as build_grammar, to_term
+from baseline_spl.symbolic.bridge import grammar as build_grammar
 from baseline_spl.symbolic import recognition
 from baseline_spl.symbolic.search import (DEFAULT_MAXIMUM_FRONTIER, SearchStats,
                                           SearchTask, Solution, wake)
@@ -167,7 +167,8 @@ class _Loop:
             settings.level, continuation=settings.continuation,
             int_literals_upto=settings.int_literals_upto))
         self.result.evaluator = evaluator.describe()
-        self.result.solutions = {t.name: Solution(task=t.name) for t in self.tasks}
+        self.result.solutions = {t.name: Solution(task=t.name, arity=t.arity)
+                                 for t in self.tasks}
         self.targets = {t.name: t for t in self.tasks}
         self.dc_tasks = recognition.build_tasks(self.tasks)
         # task -> its solution rewritten to call the library. Kept apart from
@@ -471,20 +472,13 @@ def _accept_proposals(result: RunResult, candidates: Dict[str, Sequence[Program]
             else:
                 solution.add_approximate(prior, program, distance)
 
-        if solution.program is not None and solution.term is None:
-            # `lower` needs a Term. Done for near-misses too, exactly as the wake phase does
-            # (`search.py:345`): otherwise an approximate LLM proposal would be recorded as
-            # untranslatable where an approximate enumerated one is lowered and scored, which
-            # would under-report this baseline for no reason but an inconsistency here.
-            # A task's program has as many leading lambdas as its arity; hardcoding the
-            # 1-argument shape here meant every LLM proposal on a closed or multi-argument
-            # task failed translation and was recorded untranslatable. `search.py` gets this
-            # right from `task.arity`; do the same rather than trust the default.
-            arity = getattr(targets.get(name), "arity", 0)
-            try:
-                solution.term = to_term(solution.program, concept_level=arity)
-            except Exception as exc:  # noqa: BLE001
-                log(f"  proposal for {name} could not be read back as a term ({exc})")
+        # No term to assign: `Solution.term` derives itself from `Solution.program`, so
+        # accepting a proposal above has already changed what it will return. Assigning here
+        # under an `if term is None` guard is what let an iteration-0 near-miss's term survive
+        # an iteration-1 LLM solve, for 28 of 99 concepts. Only the failure is worth saying.
+        if solution.program is not None and solution.term_failure:
+            log(f"  proposal for {name} could not be read back as a term "
+                f"({solution.term_failure})")
     return solved
 
 

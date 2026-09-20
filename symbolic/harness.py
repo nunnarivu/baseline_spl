@@ -37,6 +37,34 @@ from baseline_spl.symbolic.settings import SearchSettings
 from baseline_spl.symbolic.tasks import build_tasks, summarise_demo
 
 
+def _occupied_cell_reuse(term, task) -> int:
+    '''How many placements land on a cell that already holds a block, worst example.
+
+    A block cannot occupy a cell another block is in -- the dataset's own structures never do
+    it, and `validate_program_lib` treats it as invalid. The continuous evaluator cannot see
+    it: acceptance is the worst per-placement distance against the demo, and SPL's tolerance
+    (0.06 m) is WIDER than one lattice cell (~0.05 m), so a structure with a block one cell
+    out scores inside the bar. Measured on the 09-18 99-concept run: the three programs that
+    were accepted while not being equivalent to ground truth scored 0.0488, 0.0513 and 0.0532,
+    while CORRECT programs scored as high as 0.060 -- the two populations overlap, so no
+    threshold separates them, and this check separates them exactly (3 caught, 0 false
+    positives over 36 correct concepts).
+
+    Reported rather than rejected: acceptance stays as it was so runs remain comparable, and
+    `duplicate_cells` in the metrics says which results not to trust.
+    '''
+    from baseline_spl.symbolic.ir import positions
+
+    worst = 0
+    for value in task.parameters or [()]:
+        try:
+            cells = [tuple(c) for c in positions(term, value)]
+        except Exception:  # noqa: BLE001 - a term that will not run is reported elsewhere
+            continue
+        worst = max(worst, len(cells) - len(set(cells)))
+    return worst
+
+
 class PrecomputedAgent:
     '''Returns a class the search already found. `learn_concept` calls `generate`; by then
     the work is done, so this just hands back the right entry.'''
@@ -240,7 +268,7 @@ class SearchHarness(BaselineHarness):
         from dreamcoder.program import Program
 
         from baseline_spl.symbolic import heldout
-        from baseline_spl.symbolic.bridge import grammar, to_term
+        from baseline_spl.symbolic.bridge import grammar
 
         cfg = self.configs
         stats_path = os.path.join(cfg.run_dir, "search_stats.json")
@@ -283,19 +311,24 @@ class SearchHarness(BaselineHarness):
         for name, entry in stats.get("per_task", {}).items():
             if entry.get("status") != "solved" or not entry.get("program"):
                 continue
-            solution = Solution(task=name)
             try:
                 program = Program.parse(entry["program"])
-                solution.term = to_term(program, concept_level=False)
             except Exception as exc:  # noqa: BLE001
-                log(f"  {name}: solved program will not translate ({exc}); skipping")
+                log(f"  {name}: solved program will not parse ({exc}); skipping")
                 continue
+            # A demo-level program is closed, so arity 0.
+            solution = Solution(task=name, arity=0)
             # The frontier is what makes `Solution.status` say "solved" -- it is derived from
             # `exact`, which is `bool(self.frontier)`. Setting only `term` and `distance` left
             # every rebuilt solution reporting "unsolved", so recovery saw nothing to work with
-            # and reported 0/0 while 18 programs sat right there.
+            # and reported 0/0 while 18 programs sat right there. It is also what `term`
+            # derives from, so it has to be in place before the term is read.
             solution.frontier = [(-float(entry.get("mdl") or 0.0), program)]
             solution.distance = 0.0
+            if solution.term is None:
+                log(f"  {name}: solved program will not translate "
+                    f"({solution.term_failure}); skipping")
+                continue
             result.solutions[name] = solution
         log(f"Read {len(result.solutions)} solved closed program(s) from search_stats.json")
 
@@ -564,7 +597,13 @@ class SearchHarness(BaselineHarness):
         # Demo-level is out of scope here: what gets registered there is a class RECOVERED by
         # anti-unifying several demo tasks together (`_recover_concept_classes`), which needs
         # every one of a concept's demo tasks' outcomes at once, not a single task's.
-        registered_early: set = set()
+        # concept -> the program it was registered from, so a concept whose program changes
+        # after it was registered is caught by the final pass instead of keeping the class
+        # built from the earlier one. An exact solution's program is not supposed to move
+        # (`driver._pending` drops solved tasks and `_accept_proposals` returns early on
+        # `solution.exact`), so this should stay empty -- but "should not move" is exactly the
+        # assumption that produced the stale-term bug, and re-registering is cheap.
+        registered_early: Dict[str, str] = {}
         if granularity == "concept":
             def _register_newly_solved(result, index):
                 newly = [c for c in pending if c not in registered_early
@@ -575,7 +614,8 @@ class SearchHarness(BaselineHarness):
                     f"{', '.join(newly)}")
                 subset = OrderedDict((c, pending[c]) for c in newly)
                 self._register_and_score(subset, used_demos, result, tasks, cfg)
-                registered_early.update(newly)
+                for c in newly:
+                    registered_early[c] = str(result.solutions[c].program)
             hooks["on_iteration"] = _register_newly_solved
 
         # Then let the geometry go, before the wake phase forks its workers. Everything the
@@ -643,6 +683,10 @@ class SearchHarness(BaselineHarness):
                     entry.frontier = list(best.frontier)
                     entry.seconds = best.seconds
                     entry.programs_tried = best.programs_tried
+                # After the frontier: the setter pins this recovered term against whatever
+                # `entry.program` is at the time, and `term` re-derives itself from the
+                # program whenever the two disagree. Assigning first would let the closed
+                # demo program overwrite the generalised term this whole path exists to build.
                 entry.term = term
                 entry.distance = 0.0
                 result.solutions[concept] = entry
@@ -666,7 +710,18 @@ class SearchHarness(BaselineHarness):
         #
         # Excludes whatever `_register_newly_solved` already registered mid-run above --
         # `registered_early` is empty for demo-level runs, so this is a no-op filter there.
-        remaining = OrderedDict((c, d) for c, d in pending.items() if c not in registered_early)
+        # A concept whose program moved after it was registered comes back here, so the class
+        # on record is always the one its final program produces.
+        def _still_current(concept: str) -> bool:
+            solution = result.solutions.get(concept)
+            return solution is not None and str(solution.program) == registered_early[concept]
+
+        restale = [c for c in registered_early if c in pending and not _still_current(c)]
+        if restale:
+            log(f"Re-registering {len(restale)} concept(s) whose program changed after they "
+                f"were registered: {', '.join(restale)}")
+        remaining = OrderedDict((c, d) for c, d in pending.items()
+                                if c not in registered_early or c in restale)
         self._register_and_score(remaining, used_demos, result, tasks, cfg)
 
         if cfg.concept_save_path:
@@ -708,7 +763,8 @@ class SearchHarness(BaselineHarness):
 
             from baseline_spl.symbolic.ir import args as _args
 
-            param = next(t for t in tasks if t.name == concept).param_name
+            task = next(t for t in tasks if t.name == concept)
+            param = task.param_name
             # The two intermediate forms between "search found this" and "this is now a
             # class": the raw lambda-calculus program the search/STITCH/recovery produced,
             # and the IR term `lower` actually reads. Logged before lowering, not after, so a
@@ -775,6 +831,12 @@ class SearchHarness(BaselineHarness):
                     record["false_accept"] = True
                     log(f"<{concept}>: WARNING accepted by the {evaluator.name} evaluator but "
                         f"NOT equivalent to ground truth (program_accuracy 0.0).")
+                occupied = _occupied_cell_reuse(solution.term, task)
+                if occupied:
+                    record["duplicate_cells"] = occupied
+                    log(f"<{concept}>: WARNING places {occupied} block(s) into a cell that "
+                        f"already holds one. Ground truth never does, so the program is "
+                        f"structurally wrong however close its placements score.")
                 self._annotate_record(concept, record, result)
                 self._flush()
 

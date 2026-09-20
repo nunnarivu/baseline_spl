@@ -127,11 +127,15 @@ class Solution:
     '''
     task: str
     frontier: List[Tuple[float, Program]] = field(default_factory=list)
-    term: Optional[Term] = None
     distance: float = 1.0          # 0.0 == exact
     seconds: float = 0.0
     programs_tried: int = 0
+    arity: int = 0                 # the task's, so `term` can translate without a caller
     _approximate: Optional[Tuple[float, Program]] = None
+    # Cache for `term`, keyed on the program it was built from. Never set these directly.
+    _term: Optional[Term] = field(default=None, repr=False)
+    _term_source: Optional[str] = field(default=None, repr=False)
+    _term_failure: Optional[str] = field(default=None, repr=False)
 
     @property
     def exact(self) -> bool:
@@ -142,6 +146,53 @@ class Solution:
         if self.frontier:
             return self.frontier[0][1]
         return self._approximate[1] if self._approximate else None
+
+    @property
+    def term(self) -> Optional[Term]:
+        '''The IR form of whatever `program` currently is.
+
+        Derived, not stored, and that is the whole point. `program` is itself derived from
+        `frontier`, which `add_exact`/`add_approximate` mutate: an LLM proposal accepted in
+        iteration 1 silently replaces the program an enumerated near-miss put there in
+        iteration 0. While this was a plain field written under an `if term is None` guard,
+        that replacement left the ORIGINAL program's term in place -- 28 of 99 concepts in
+        `lilo_gptluna_concept_level_depthimages_run1` were lowered, registered and scored
+        from a term belonging to a program the run had already discarded, and every one of
+        them scored program_accuracy 0.0 with the correct program sitting in the record next
+        to it. Re-deriving on read cannot drift, and leaves no guard to get wrong.
+        '''
+        program = self.program
+        if program is None:
+            return None
+        source = str(program)
+        if source != self._term_source:
+            self._term_source = source
+            self._term_failure = None
+            try:
+                self._term = to_term(program, concept_level=self.arity)
+            except Exception as exc:          # noqa: BLE001 - reported, see `term_failure`
+                # The harness records this as `search_untranslatable`; the reason is the only
+                # thing that explains why a solved concept produced no class.
+                self._term = None
+                self._term_failure = f"{type(exc).__name__}: {exc}"
+        return self._term
+
+    @term.setter
+    def term(self, value: Optional[Term]) -> None:
+        '''Pin a term the caller derived some other way (demo-level class recovery).
+
+        Recording the current program as its source is what stops the property from
+        immediately re-deriving over it on the next read.
+        '''
+        self._term = value
+        self._term_source = str(self.program) if self.program is not None else None
+        self._term_failure = None
+
+    @property
+    def term_failure(self) -> Optional[str]:
+        '''Why `term` is None despite a program, or None if it translated.'''
+        _ = self.term          # derive on demand, so the reason is never stale either
+        return self._term_failure
 
     @property
     def log_prior(self) -> float:
@@ -178,7 +229,12 @@ class Solution:
         self.frontier.append((prior, program))
         self.frontier.sort(key=lambda entry: -entry[0])     # highest prior = lowest MDL first
         del self.frontier[maximum_frontier:]
-        self.distance = distance
+        # Only if it survived the trim. `distance` is read as the statistic of the program the
+        # solution REPORTS (`driver.py` writes it out as `search_score`/`trace_distance`), so
+        # letting the 6th-best accepted program set it would describe one that was just
+        # discarded. Invisible under `exact`, where every distance is 0.0.
+        if any(p is program for _pr, p in self.frontier):
+            self.distance = distance
         return True
 
     def add_approximate(self, prior: float, program: Program, distance: float) -> None:
@@ -384,7 +440,7 @@ def wake(grammar, tasks: Sequence[SearchTask], *, timeout: float = 60.0,
     is not across MDL sub-bands.
     '''
     stats = SearchStats()
-    stats.per_task = {t.name: Solution(task=t.name) for t in tasks}
+    stats.per_task = {t.name: Solution(task=t.name, arity=t.arity) for t in tasks}
     started = time.time()
     deadline = started + timeout
     lower, budget = 0.0, budget_increment
@@ -450,19 +506,13 @@ def wake(grammar, tasks: Sequence[SearchTask], *, timeout: float = 60.0,
             pool.join()
 
     stats.seconds = time.time() - started
-    arity_of_task = {t.name: t.arity for t in tasks}
-    for solution in stats.per_task.values():
-        if solution.term is None and solution.program is not None:
-            try:
-                solution.term = to_term(solution.program,
-                                        concept_level=arity_of_task.get(solution.task, 0))
-            except Exception as exc:  # noqa: BLE001
-                # The harness reports this as `search_untranslatable`, but only the reason
-                # explains why a solved concept produced no class.
-                if log:
-                    log(f"  {solution.task}: {solution.status}, but the program could not be "
-                        f"read back as a term ({type(exc).__name__}: {exc})")
-                solution.term = None
+    # `Solution.term` derives itself from `Solution.program`, so there is nothing to assign
+    # here any more -- only a reason to report when that derivation fails.
+    if log:
+        for solution in stats.per_task.values():
+            if solution.program is not None and solution.term_failure:
+                log(f"  {solution.task}: {solution.status}, but the program could not be "
+                    f"read back as a term ({solution.term_failure})")
     return stats
 
 

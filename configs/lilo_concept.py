@@ -74,7 +74,7 @@ class CommonConfig:
     # Completion budget for codegen.generate_with_retries and call_vlm. See default.py's
     # copy of this field for the full rationale (reasoning models can spend the whole
     # budget on hidden reasoning and return empty content if cut off before answering).
-    codegen_max_tokens = 200000
+    codegen_max_tokens = 10000
 
     # Run each generated class on the demonstrations and retry with a report (crash, block
     # count, per-block distance to the demo's final state, bookkeeping), as SPL's Generalize
@@ -109,7 +109,7 @@ class CommonConfig:
 
     # Output directory under runs/. None means use the config file's own name, so two
     # configs can never overwrite each other's results.
-    run_name = "lilo_gptluna_concept_level_depthimages_run1"
+    run_name = "lilo_gptluna_concept_level_depthimages_run2"
 
 
 class CapConfig(CommonConfig):

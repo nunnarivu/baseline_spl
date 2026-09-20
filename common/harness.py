@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from collections import defaultdict
 from typing import Any, Dict, List
 
@@ -297,7 +298,8 @@ class BaselineHarness:
         '''Mirrors pipelines/learn_spl_concept.py:infer, minus robot execution.'''
         from SPL.dataloader.datasets import build_inductive_structure_dataloader
         from SPL.utils.metrics import (compute_state_metrics, compute_plan_metrics,
-                                       run_gt_program, run_predicted_program)
+                                       failed_state_metrics, failed_stability_metrics,
+                                       initialization_code, run_gt_program, run_predicted_program)
         from SPL.model.executor import mesh_centroid, make_focus
 
         cfg = self.configs
@@ -352,29 +354,58 @@ class BaselineHarness:
                     _plan, final_state = self.spl.execute(
                         instruction, gt_states[0], sketch_info, init_focus=anchor_focus)
                 except Exception as exc:  # noqa: BLE001
+                    # A class that cannot run is scored at its worst, not left out of the
+                    # averages: excluding it made a baseline look better the more demos it
+                    # failed to execute.
+                    reason = f"{type(exc).__name__}: {exc}"
+                    log(f"Execution failed for <{concept}/{data.get('demo_id')}>: {reason}\n"
+                        f"{traceback.format_exc()}")
+                    m = failed_state_metrics(reason, ev.max_mse)
+                    m.update(compute_plan_metrics(
+                        None, run_gt_program(data.get("program"), len(gt_states[0])),
+                        pred_error=reason))
+                    m.update(failed_stability_metrics(reason))
                     records.append({"concept": concept, "demo_id": data.get("demo_id"),
-                                    "status": f"execution_failed: {exc}"})
+                                    "status": f"execution_failed: {reason}", "error": reason,
+                                    "pred_concept": sketch_info["concept"], "_demo": data,
+                                    **{k: m[k] for k in ev.metric_keys if k in m}})
                     continue
 
                 rec = {"concept": concept, "demo_id": data.get("demo_id"), "status": "ok",
                        "pred_concept": sketch_info["concept"]}
+                gt_trace = None
                 try:
+                    num_objects = len(gt_states[0])
+                    gt_trace = run_gt_program(data.get("program"), num_objects)
                     m = compute_state_metrics(
                         final_state.state, final_state.objects_moved, gt_states,
                         data.get("objects_moved"),
                         min_movement=ev.min_movement_distance, max_mse=ev.max_mse)
-                    num_objects = len(gt_states[0])
-                    init_code = self.shared_sketch.initialized_sketch(sketch_info)
+                    # `objects` binds to the ideal executor's pool rather than the sketch's
+                    # saved id list, so a class needing more blocks is scored, not dropped.
+                    init_code = initialization_code(
+                        sketch_info["concept"],
+                        {a: d["value"] for a, d in sketch_info["arguments"].items()})
                     m.update(compute_plan_metrics(
                         run_predicted_program(
                             self.spl.concept_library.inductive_concepts_definition,
                             init_code, num_objects),
-                        run_gt_program(data.get("program"), num_objects)))
+                        gt_trace))
                     m.update(self.spl._simulate_stability(final_state, data, cfg.test_dataset_dir))
-                    rec.update({k: m[k] for k in ev.metric_keys if k in m})
-                    rec["_demo"] = data
                 except Exception as exc:  # noqa: BLE001
-                    rec["status"] = f"metrics_failed: {exc}"
+                    # Mirrors SPL's own handling: score the demo at its worst and keep it,
+                    # with the reason, instead of leaving it out of every average.
+                    reason = f"{type(exc).__name__}: {exc}"
+                    log(f"Metric evaluation failed for <{concept}/{data.get('demo_id')}>: {reason}\n"
+                        f"{traceback.format_exc()}")
+                    rec["status"] = f"metrics_failed: {reason}"
+                    m = failed_state_metrics(reason, ev.max_mse)
+                    m.update(compute_plan_metrics(None, gt_trace, pred_error=reason))
+                    m.update(failed_stability_metrics(reason))
+                if "error" in m:
+                    rec["error"] = m["error"]
+                rec.update({k: m[k] for k in ev.metric_keys if k in m})
+                rec["_demo"] = data
                 records.append(rec)
 
         self._write_inference_metrics(records)
@@ -388,17 +419,22 @@ class BaselineHarness:
     def _write_inference_metrics(self, records: List[dict]) -> None:
         cfg = self.configs
         keys = cfg.evaluation_config.metric_keys
-        ok = [r for r in records if r.get("status") == "ok"]
+        # Every record that carries metrics counts, not only the ones that succeeded: a
+        # demo that failed to execute or to score now holds worst-case values, and leaving
+        # those out made a baseline look better the more demos it failed. A record with no
+        # metrics at all (an ungrounded concept) has nothing to average and stays out.
+        ok = [r for r in records if "final_state_mse" in r]
 
         def _mean(recs, k):
-            vals = [r[k] for r in recs if k in r and r[k] is not None]
+            vals = [r[k] for r in recs if r.get(k) is not None]
             return float(np.mean(vals)) if vals else None
 
         by_concept = defaultdict(list)
         for r in ok:
             by_concept[r["concept"]].append(r)
 
-        per_concept = {c: {**{k: _mean(rs, k) for k in keys}, "num_demos": len(rs)}
+        per_concept = {c: {**{k: _mean(rs, k) for k in keys}, "num_demos": len(rs),
+                           "num_failed": sum(1 for r in rs if "error" in r)}
                        for c, rs in by_concept.items()}
         # program_accuracy is a property of the concept, not of one demo.
         for c, rs in by_concept.items():
