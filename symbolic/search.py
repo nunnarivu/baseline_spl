@@ -59,6 +59,26 @@ DEFAULT_MAXIMUM_FRONTIER = 5
 DEFAULT_EVALUATOR = ExactEvaluator()
 
 
+def alias_task_name(name: str) -> str:
+    '''A task name as it may be SHOWN TO A MODEL, under SPLConfig.concept_name.
+
+    Task names are the dataset's concept (`row`) or, at demo granularity, `<concept>_<demo_id>`
+    (`row_0012`) -- so under the anonymisation ablation they still carry the real concept name
+    even though every instruction has been rewritten. `tasks.py` builds them, `harness.py`
+    matches on them and `heldout.py` looks the concept up in PROGRAM_LIB, so the stored name
+    must stay natural; only what a prompt renders passes through here.
+
+    Identity when the ablation is off, and for any name that is not a concept.
+    '''
+    from SPL.utils.concept_naming import concept_alias
+
+    aliased = concept_alias(name)
+    if aliased != name or "_" not in name:
+        return aliased
+    concept, _, suffix = name.rpartition("_")
+    return f"{concept_alias(concept)}_{suffix}"
+
+
 @dataclass
 class SearchTask:
     '''One synthesis task: a concept, and one (parameter, placement cells) example per demo.

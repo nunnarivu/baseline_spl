@@ -355,8 +355,10 @@ class BaselineHarness:
                         first = int(np.argmax([np.linalg.norm(mesh_centroid(a) - mesh_centroid(b))
                                                for a, b in zip(gt_states[0], gt_states[1])]))
                         anchor_focus = make_focus(mesh_centroid(gt_states[1][first]))
+                    from SPL.utils.metrics import strip_sketch_objects
                     _plan, final_state = self.spl.execute(
-                        instruction, gt_states[0], sketch_info, init_focus=anchor_focus)
+                        instruction, gt_states[0],
+                        strip_sketch_objects(sketch_info, len(gt_states[0])), init_focus=anchor_focus)
                 except Exception as exc:  # noqa: BLE001
                     # A class that cannot run is scored at its worst, not left out of the
                     # averages: excluding it made a baseline look better the more demos it

@@ -11,11 +11,13 @@ Two rules keep the comparison honest:
      two can never drift). Baselines emit the same class SPL does — that is deliberate
      and generous: it is the only way ``run_predicted_program``, ``compute_plan_metrics``
      and ``check_program_equivalence`` can score them at all.
-  2. Worked examples never use an evaluated concept. SPL's own
-     ``CONCEPT_GENERALIZATION_PROMPT`` uses the invented concept ``rewot`` for exactly
-     this reason; handing a baseline a worked ``row`` or ``tower`` would leak the answer
-     and break the comparison in the generous direction. The example below uses the
-     invented concept ``zigzag_lane``, which is in no split.
+  2. Worked examples never use an evaluated concept. Handing a baseline a worked ``row``
+     or ``tower`` would leak the answer and break the comparison in the generous
+     direction. The example below uses the invented concept ``zigzag_lane``, which is in
+     no split. SPL's own ``SKETCH_PROMPT`` and ``CONCEPT_GENERALIZATION_PROMPT`` now use
+     the same name: the latter's old invented concept was ``rewot``, which is exactly what
+     the ``concept_name = "reversed"`` ablation renames ``tower`` to, so its worked class
+     collided with the very concept the model was being asked to write.
 '''
 
 from __future__ import annotations

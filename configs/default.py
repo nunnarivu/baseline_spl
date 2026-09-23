@@ -422,6 +422,12 @@ class LiloConfig(DreamCoderConfig):
     budgets and differ by exactly LILO's contributions.
     '''
 
+    # LILO does call a model (the proposer and the library namer), unlike B3-a, so it
+    # takes the models named at the top of this file instead of inheriting DreamCoderConfig's
+    # None. With None, LLMBackend fell back to SPL's own GeneralizeConfig.llm_model.
+    codegen_model = CODEGEN_MODEL
+    vlm_model = VLM_MODEL
+
     # Sampling, taken from LILO's own experiment config
     # (third_party/lilo/experiments_iterative/templates/template_lilo.json):
     #   "n_queries_per_task": 4, "n_samples_per_query": 4, "temperature": 0.7

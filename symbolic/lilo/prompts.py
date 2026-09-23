@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
+from baseline_spl.symbolic.search import alias_task_name
+
 # gpt_base.py:39 -- Haskell-style comment prefix for the language line.
 PREFIX_LANGUAGE = "-- "
 PREFIX_PROGRAM = ""
@@ -171,7 +173,9 @@ def task_language(task, *, include_demonstration: bool = True) -> str:
     keyframes on the message instead, so repeating it as text would hand the model strictly
     more than either CaP-images or Demo2Code-vlm receives.
     '''
-    parts = [task.instruction or task.name]
+    # The fallback is the task NAME, which carries the dataset's concept however the
+    # instruction was anonymised; alias it so no prompt can reintroduce the real word.
+    parts = [task.instruction or alias_task_name(task.name)]
     if not include_demonstration:
         return parts[0]
     from baseline_spl.symbolic.ir import args as _args

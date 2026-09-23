@@ -29,7 +29,7 @@ from baseline_spl.symbolic._dreamcoder import Grammar, Invented, Program
 from baseline_spl.symbolic.bridge import grammar as build_grammar
 from baseline_spl.symbolic import recognition
 from baseline_spl.symbolic.search import (DEFAULT_MAXIMUM_FRONTIER, SearchStats,
-                                          SearchTask, Solution, wake)
+                                          SearchTask, Solution, alias_task_name, wake)
 from baseline_spl.symbolic.settings import SearchSettings
 from baseline_spl.symbolic.stitch_bridge import best_compression, program_mdl, reweight
 
@@ -199,7 +199,9 @@ class _Loop:
         # Few-shot material: what this method's own search has already found, paired with the
         # instruction it was found for. Never `demo['program']` -- these are the method's
         # discoveries, exactly what LILO shows itself.
-        found = [(self.targets[n].instruction or n, str(s.program))
+        # `or alias_task_name(n)`: the fallback is a task name, which still carries the real
+        # concept under the anonymisation ablation. Identity when it is off.
+        found = [(self.targets[n].instruction or alias_task_name(n), str(s.program))
                  for n, s in self.result.solutions.items() if s.exact and n in self.targets]
         try:
             candidates = self.propose_hook(self.result.grammar, pending, index,

@@ -22,6 +22,8 @@ import json
 import re
 from typing import Dict, List, Optional, Sequence
 
+from baseline_spl.symbolic.search import alias_task_name
+
 SYSTEM = '''You are writing software documentation for a library of functions that build
 block structures on a 3-D lattice.
 
@@ -145,7 +147,10 @@ class LibraryNamer:
             lines.append("# Where it is used")
             lines.append("")
             for name, program in usages[:6]:
-                lines.append(f"    building a {name}:")
+                # The corpus is keyed by task name, i.e. the dataset's concept -- so without
+                # this the namer reads "building a staircase:" however the instruction was
+                # anonymised, and its names feed back into later proposer prompts.
+                lines.append(f"    building a {alias_task_name(name)}:")
                 lines.append(f"    {program}")
             lines.append("")
         if taken:

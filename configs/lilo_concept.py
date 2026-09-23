@@ -105,7 +105,7 @@ class CommonConfig:
     vlm_max_image_px = 512
     # Every keyframe here is a placement, so subsampling deletes construction steps.
     # Last resort only; the serializer warns when it fires.
-    vlm_max_keyframes = 40
+    vlm_max_keyframes = 100
 
     # Output directory under runs/. None means use the config file's own name, so two
     # configs can never overwrite each other's results.
@@ -414,6 +414,12 @@ class LiloConfig(DreamCoderConfig):
     Inherits every DreamCoderConfig knob, so the two baselines can be run at matched search
     budgets and differ by exactly LILO's contributions.
     '''
+
+    # LILO does call a model (the proposer and the library namer), unlike B3-a, so it
+    # takes the models named at the top of this file instead of inheriting DreamCoderConfig's
+    # None. With None, LLMBackend fell back to SPL's own GeneralizeConfig.llm_model.
+    codegen_model = CODEGEN_MODEL
+    vlm_model = VLM_MODEL
 
     # Sampling, taken from LILO's own experiment config
     # (third_party/lilo/experiments_iterative/templates/template_lilo.json):

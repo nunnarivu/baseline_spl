@@ -168,6 +168,17 @@ class BaselineConfig(SPLConfig):
                                    f"or type yes to run with {mismatched}.")
         settings = _public_attrs(run_cfg)
         settings.pop("run_name", None)   # resolved by the caller and passed explicitly
+        # The anonymisation ablation gets its own run directory. A natural and an anonymised
+        # run must not share artifacts: SayCan's plan_library.json stores instructions verbatim
+        # and replays them as worked examples, which would show one mode's wording to the other.
+        # Read from SPLConfig, not from `settings`: the baselines' CommonConfig is standalone
+        # (it does not subclass SPLConfig), so the knob reaches BaselineConfig by class
+        # inheritance rather than through the overrides. SPLConfig is also the ONLY place to
+        # set it -- the sketch agent scopes its cache from the same global, so a per-baseline
+        # override would put the run in one mode's directory with the other mode's cache.
+        naming = getattr(SPLConfig, "concept_name", "normal")
+        if naming != "normal":
+            run_name = f"{run_name}_anon{naming}"
         configs = cls(run_name, **settings)
 
         configs.concepts_to_learn = list(run_cfg.concepts)
@@ -176,6 +187,12 @@ class BaselineConfig(SPLConfig):
         # the deep-copied Generalize config, and the sketch agent would fail later, far from here.
         if run_cfg.codegen_model is not None:
             configs.generalize_config.llm_model = run_cfg.codegen_model
+            # The sketch agent reads its provider and model from sketch_config, which would
+            # otherwise be SPL's own. Set as a pair, never one alone: a baseline provider with
+            # SPL's model name (or the reverse) is rejected by the server. Credentials and
+            # base_url stay SPL's.
+            configs.sketch_config.llm_provider = run_cfg.llm_provider
+            configs.sketch_config.llm_model = run_cfg.codegen_model
 
         import inspect
         from SPL.utils.config_snapshot import save_config_snapshot
