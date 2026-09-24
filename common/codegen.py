@@ -20,8 +20,10 @@ from __future__ import annotations
 import ast
 from typing import Dict, List, Optional, Tuple
 
+from SPL.config.spl_config import ALL_CONCEPTS
 from SPL.model.generalize import ConceptClassParseError, GeneralizeAgent
 from SPL.model.text_utils import extract_code_block
+from baseline_spl.common.harness import log
 
 # SPL's evaluation retry prompts (GeneralizeAgent._build_eval_retry_prompt and
 # _build_bookkeeping_prompt), reworded: a baseline never saw plans or execution traces.
@@ -54,17 +56,47 @@ def validate(code: str) -> None:
     GeneralizeAgent._validate_class_code(code)
 
 
+def _target_class(tree: ast.Module, code: str, wanted: Optional[str] = None) -> ast.ClassDef:
+    '''The concept class among the module's top-level classes.
+
+    Chosen by shape -- a `construct` method and an `__init__` taking `objects` -- rather
+    than by position. Models that also define a substructure helper class put the concept
+    class second as often as first, and the rename, the signature and the name it is
+    registered under all have to agree on which class is the concept.
+
+    A class already named `wanted` wins outright. Without that, a helper class named after
+    a real concept is equally well shaped, and renaming *it* to `wanted` would leave two
+    classes with the same name, the second silently shadowing the first.
+    '''
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
+    if not classes:
+        raise ConceptClassParseError("no class definition found", code=code)
+
+    if wanted is not None:
+        exact = next((c for c in classes if c.name == wanted), None)
+        if exact is not None:
+            return exact
+
+    def shaped(cls: ast.ClassDef) -> bool:
+        init = next((n for n in cls.body
+                     if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
+        return (init is not None
+                and any(a.arg == "objects" for a in init.args.args)
+                and any(isinstance(n, ast.FunctionDef) and n.name == "construct"
+                        for n in cls.body))
+
+    # Falling back to the first class keeps the error messages below pointing at something
+    # concrete when nothing matches, instead of raising a less useful "no class" here.
+    return next((c for c in classes if shaped(c)), classes[0])
+
+
 def class_signature(code: str) -> Tuple[str, Dict[str, type]]:
     '''(class name, {argument: type}) read off the generated class's __init__.
 
     Used when no sketch was given, so the name and arguments are whatever the model
     invented and have to be recovered from the code itself.
     '''
-    tree = ast.parse(code)
-    classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
-    if not classes:
-        raise ConceptClassParseError("no class definition found", code=code)
-    cls = classes[0]
+    cls = _target_class(ast.parse(code), code)
 
     init = next((n for n in cls.body
                  if isinstance(n, ast.FunctionDef) and n.name == "__init__"), None)
@@ -96,23 +128,31 @@ def ensure_class_name(code: str, wanted: str) -> str:
     recursive concepts.
     '''
     tree = ast.parse(code)
-    classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
-    if not classes:
-        raise ConceptClassParseError("no class definition found", code=code)
-    original = classes[0].name
-    if original == wanted:
-        return code
+    target = _target_class(tree, code, wanted)
+    renames = {} if target.name == wanted else {target.name: wanted}
+
+    # Any OTHER top-level class named after a real concept is neutralised.
+    # register_inductive_concepts execs the WHOLE source into the library namespace
+    # (SPL/model/concept_library.py), so a leftover `class tower` would bind `tower` there
+    # as a live callable even under concept_name="reversed", and a later concept could
+    # call it. Renaming keeps the model's own substructure working while keeping the real
+    # name out of the library.
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node is not target and node.name in ALL_CONCEPTS:
+            renames[node.name] = f"_local_{node.name}"
+            log(f"[codegen] neutralised extra class {node.name!r} -> {renames[node.name]!r}")
+
+    if not renames:
+        return code   # unchanged source, so the model's own comments survive
 
     class _Rename(ast.NodeTransformer):
         def visit_ClassDef(self, node: ast.ClassDef):
             self.generic_visit(node)
-            if node.name == original:
-                node.name = wanted
+            node.name = renames.get(node.name, node.name)
             return node
 
         def visit_Name(self, node: ast.Name):
-            if node.id == original:
-                node.id = wanted
+            node.id = renames.get(node.id, node.id)
             return node
 
     renamed = ast.fix_missing_locations(_Rename().visit(tree))

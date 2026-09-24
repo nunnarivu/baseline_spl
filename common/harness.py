@@ -186,6 +186,23 @@ class BaselineHarness:
             (concept_name, generated.attributes, generated.code))
         log(f"Registered concept <{concept_name}>.")
 
+        # Under the anonymisation ablation, did the real word reach the model anyway? The
+        # class name and the library calls are forced to the alias, but a local variable or
+        # a comment saying "tower" inside <rewot> means it did. Counted, never rewritten:
+        # rewriting would erase the measurement. Scoped to the target plus the concepts
+        # already in the library, which are the only ones this class could be built from.
+        leaked = {}
+        if getattr(self.configs, "concept_name", "normal") != "normal":
+            from SPL.utils.concept_naming import concept_alias, leaked_concept_names
+
+            in_library = set(self.spl.concept_library.inductive_concepts)
+            involved = [c for c in (self.configs.concepts_to_learn or [])
+                        if concept_alias(c) in in_library] + [gt_concept]
+            leaked = leaked_concept_names(generated.code, involved)
+            if leaked:
+                log(f"LEAK <{concept_name}>: the generated source still names "
+                    f"{leaked} despite concept_name={self.configs.concept_name!r}.")
+
         status = "ok"
         if no_sketch:
             # Ground each instruction onto the class we just registered. Demonstrations
@@ -231,6 +248,8 @@ class BaselineHarness:
                   "status": status, **metrics}
         if "evaluator" in generated.info:   # calls, passed, best_score (use_evaluator_feedback)
             record["evaluator"] = generated.info["evaluator"]
+        if leaked:                          # only under concept_name != "normal"
+            record["leaked_names"] = leaked
         self._metric_records[gt_concept] = record
 
         self._time_records[gt_concept] = {

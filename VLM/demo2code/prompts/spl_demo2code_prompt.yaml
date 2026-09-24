@@ -12,9 +12,11 @@
 #   [[Task Specification:]]
 #
 # FAIRNESS: every worked example uses the invented concept `zigzag_lane`, which appears
-# in no train or test split. SPL's own CONCEPT_GENERALIZATION_PROMPT uses the invented
-# `rewot` for the same reason. Never put row / tower / staircase / pyramid / arch_bridge /
-# pins / psi / x in these examples: it would hand the baseline the answer.
+# in no train or test split. SPL's own SKETCH_PROMPT and CONCEPT_GENERALIZATION_PROMPT now
+# use the same name for the same reason. Never put row / tower / staircase / pyramid /
+# arch_bridge / pins / psi / x in these examples: it would hand the baseline the answer.
+# An invented name must also stay clear of the concept_name ablation's aliases -- the old
+# `rewot` was "tower" reversed, so it collided under concept_name = "reversed".
 
 prompt_version: spl-v1
 

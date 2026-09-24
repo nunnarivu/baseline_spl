@@ -176,6 +176,11 @@ def main() -> int:
 
     cfg.use_demo = False
     cfg.include_primitive_stats = False   # would need the SRN and the demo's meshes
+    # The evaluator scores a candidate against the demonstrations' final states, so it
+    # reads the very meshes this check forbids. Config files that set use_demo=False pair
+    # it with use_evaluator_feedback=False; set it here too, since use_demo is being
+    # overridden after BaselineConfig was built.
+    cfg.use_evaluator_feedback = False
     backend = FakeBackend()
     agent = CodeAsPoliciesAgent(cfg, backend)
     try:
@@ -240,6 +245,101 @@ def main() -> int:
         print("  OK   assert_parity accepts the real CapConfig")
     except ValueError as exc:
         failures.append(f"assert_parity rejected the real CapConfig: {exc}")
+
+    # 6: no prompt may name an evaluated concept. Worked examples use invented names
+    # (zigzag_lane, spiral_ramp); a real one would hand the model the answer, and under
+    # concept_name != "normal" it also defeats the anonymisation outright -- the model is
+    # told "tower" in the same breath as it is asked to build a "rewot".
+    import ast
+    import re
+
+    from SPL.config.spl_config import ALL_CONCEPTS, SPLConfig
+    from SPL.model.prompts import CONCEPT_GENERALIZATION_PROMPT, CONCEPT_STRUCTURE_PROMPT
+    from baseline_spl.common import codegen, dsl_prompt
+
+    # 'key' and 'x' are also concept names, but here they are the English word in
+    # "key blocks" and an axis label. The `_`-aware boundary already excludes key_blocks.
+    BENIGN = {"key", "x"}
+    concept_pattern = re.compile(
+        r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(n) for n in
+                                         sorted(ALL_CONCEPTS, key=len, reverse=True))
+        + r")(?![A-Za-z0-9_])")
+
+    previous_mode = SPLConfig.concept_name
+    SPLConfig.concept_name = "reversed"
+    try:
+        prompts = {
+            "CONCEPT_STRUCTURE_PROMPT": CONCEPT_STRUCTURE_PROMPT,
+            "CONCEPT_GENERALIZATION_PROMPT": CONCEPT_GENERALIZATION_PROMPT,
+            "DSL_DOC": dsl_prompt.DSL_DOC,
+            "WORKED_EXAMPLE": dsl_prompt.WORKED_EXAMPLE,
+            "baseline system prompt": dsl_prompt.build_system_prompt("", True, ""),
+            "baseline system prompt (no sketch)": dsl_prompt.build_system_prompt("", False, ""),
+        }
+        clean = True
+        for label, text in prompts.items():
+            named = sorted(set(m.group(1) for m in concept_pattern.finditer(text)) - BENIGN)
+            if named:
+                failures.append(f"{label} names evaluated concept(s) {named}")
+                clean = False
+        if clean:
+            print(f"  OK   none of the {len(prompts)} prompts names an evaluated concept")
+    finally:
+        SPLConfig.concept_name = previous_mode
+
+    # 7: register_inductive_concepts execs the WHOLE generated source into the library
+    # namespace, so a second top-level class named after a real concept would bind that
+    # real name there even under the ablation. ensure_class_name must neutralise it, and
+    # must not produce two classes with the same name when the helper comes first.
+    body = '''
+    def __init__(self, length: int, objects: list):
+        self.length = length
+        self.objects = list(objects)
+        self.constructed = False
+        self._plan = []
+        self._placed = []
+        self._substructures = []
+
+    def construct(self):
+        self.constructed = True
+
+    @staticmethod
+    def argument_sampler():
+        yield (1, None)
+
+    @property
+    def plan(self):
+        return list(self._plan)
+
+    @property
+    def blocks(self):
+        return list(self._placed)
+
+    @property
+    def substructures(self):
+        return list(self._substructures)
+
+    @property
+    def key_blocks(self):
+        return self._placed[:1]
+
+    @property
+    def actions(self):
+        return []
+'''
+    for label, source in (("target first", f"class wor:{body}\nclass tower:{body}"),
+                          ("helper first", f"class tower:{body}\nclass wor:{body}")):
+        renamed = codegen.ensure_class_name(source, "wor")
+        names = [n.name for n in ast.parse(renamed).body if isinstance(n, ast.ClassDef)]
+        real = [n for n in names if n in ALL_CONCEPTS]
+        if real:
+            failures.append(f"ensure_class_name ({label}) left real-named class(es) {real}")
+        elif len(names) != len(set(names)):
+            failures.append(f"ensure_class_name ({label}) produced duplicate classes {names}")
+        elif "wor" not in names:
+            failures.append(f"ensure_class_name ({label}) lost the concept class: {names}")
+        else:
+            print(f"  OK   ensure_class_name neutralises a real-named helper ({label})")
 
     print()
     if failures:
