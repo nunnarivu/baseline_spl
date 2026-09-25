@@ -87,6 +87,17 @@ class BaselineHarness:
 
         self.configs = configs
         self.spl = SPL(configs)
+        # The baseline's config file, now that SPL's launch guard has accepted this launch: the latest
+        # as baseline_config_used.py, and one copy per launch beside its log.
+        if getattr(configs, "run_config_file", None):
+            from SPL.utils.config_snapshot import save_config_snapshot
+            try:
+                save_config_snapshot(configs.run_config_file, configs.run_dir, "baseline_config_used.py")
+                if self.spl.log_path:
+                    save_config_snapshot(configs.run_config_file, os.path.dirname(self.spl.log_path),
+                                         os.path.basename(self.spl.log_path).replace(".log", "_baseline_config.py"))
+            except OSError as exc:
+                log(f"Could not save a config snapshot for this run: {exc}")
         self.shared_sketch = SharedSketch(self.spl)
         self.agent = agent
 

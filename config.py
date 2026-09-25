@@ -33,6 +33,11 @@ def load(name: str = None):
     run, not the scaffolding that tests the code.
     '''
     name = name or os.environ.get("BASELINE_CONFIG") or DEFAULT_CONFIG
+    if os.environ.get("SPL_RUN_DIR"):
+        # launch_run.sh: the run's own copy of its config file, never the working tree's.
+        from SPL.utils.run_dir import load_config_module
+        return load_config_module(f"baseline_spl.configs.{name}",
+                                  Path(os.environ["SPL_RUN_DIR"]) / "config" / "baseline_config.py")
     try:
         return importlib.import_module(f"baseline_spl.configs.{name}")
     except ImportError:

@@ -106,7 +106,8 @@ class BaselineConfig(SPLConfig):
 
     def __init__(self, run_name: str, **overrides):
         self.run_name = run_name
-        run_dir = RUNS_ROOT / run_name
+        # launch_run.sh names the run directory; otherwise it is runs/<run_name>.
+        run_dir = Path(os.environ["SPL_RUN_DIR"]) if os.environ.get("SPL_RUN_DIR") else RUNS_ROOT / run_name
         self.run_dir = str(run_dir)
 
         self.sketch_config = SketchConfig()
@@ -121,6 +122,14 @@ class BaselineConfig(SPLConfig):
 
         for key, value in overrides.items():
             setattr(self, key, value)
+
+        if os.environ.get("SPL_RUN_DIR"):
+            # launch_run.sh decides the library, never the config file: a new run starts empty,
+            # --resume continues from this run's own library and skips what it already learned.
+            library = run_dir / "concept_library.pt"
+            resume = os.environ.get("SPL_RESUME") == "1"
+            self.load_concept_checkpoint = str(library) if resume and library.exists() else None
+            self.ignore_learnt_concepts = True if resume else self.ignore_learnt_concepts
 
         # Checked after overrides, since the run config is what names a checkpoint. Both
         # directions: loading SPL's library leaks its concepts in, saving into it destroys them.
@@ -177,7 +186,9 @@ class BaselineConfig(SPLConfig):
         # set it -- the sketch agent scopes its cache from the same global, so a per-baseline
         # override would put the run in one mode's directory with the other mode's cache.
         naming = getattr(SPLConfig, "concept_name", "normal")
-        if naming != "normal":
+        if os.environ.get("SPL_RUN_DIR"):
+            run_name = Path(os.environ["SPL_RUN_DIR"]).name   # launch_run.sh: the directory it was given
+        elif naming != "normal":
             run_name = f"{run_name}_anon{naming}"
         configs = cls(run_name, **settings)
 
@@ -195,12 +206,9 @@ class BaselineConfig(SPLConfig):
             configs.sketch_config.llm_model = run_cfg.codegen_model
 
         import inspect
-        from SPL.utils.config_snapshot import save_config_snapshot
-        try:
-            save_config_snapshot(inspect.getfile(run_cfg), configs.run_dir,
-                                "baseline_config_used.py")
-        except OSError as exc:
-            warnings.warn(f"Could not save a config snapshot for this run: {exc}")
+        # Snapshotted by BaselineHarness once SPL's launch guard has accepted this launch, so a
+        # refused launch never overwrites the record of the run.
+        configs.run_config_file = inspect.getfile(run_cfg)
         return configs
 
     def __repr__(self):

@@ -38,6 +38,8 @@ baseline part spells out the condition — `simple_exp_cap_images_nosketch`,
 | **Demo2Code-text** | instruction + symbolic state, staged summarization (upstream-faithful) | `Demo2CodeConfig.variant = "text"` |
 | **Demo2Code-VLM** | instruction + keyframe **images**, summarized by a vision model | `Demo2CodeConfig.variant = "vlm"` |
 | **SayCan** | demonstrations + one primitive at a time, **no program** | `python -m baseline_spl.VLM.saycan.run` |
+| **DreamCoder (B3-a)** | demonstrations only — **no LLM**; programs come from typed enumeration | `python -m baseline_spl.symbolic.dreamcoder.run` |
+| **LILO (B3-b)** | the same search, plus an LLM proposer and library auto-documentation | `python -m baseline_spl.symbolic.lilo.run` |
 
 SayCan is the control for whether a program is needed at all: it scores the available
 primitives at each step and executes the best, so `row(5)` needs five placements chosen
@@ -62,11 +64,16 @@ CaP-text vs Demo2Code-text isolates **staged recursive summarization** (Demo2Cod
 contribution); text vs images isolates **privileged 3-D state**, now available in both
 methods.
 
-`CommonConfig.learn` and `CommonConfig.inference` choose the phases. `resume` (default
-True) loads the concepts this baseline learned before, so an interrupted run continues,
-new concepts can be added to an existing run, and inference can run in a separate
-invocation. Already-learned concepts are skipped and the metric files are appended to.
-Set `resume_from` to continue from a different run's library.
+`CommonConfig.learn` and `CommonConfig.inference` choose the phases. The concept library is
+loaded and saved through the same knobs `SPLConfig` uses, with this package's values:
+`load_concept_checkpoint` names the library to load (default `None`, which loads nothing),
+`skip_loading_concepts` leaves concepts out of it, `ignore_learnt_concepts` (default True)
+skips learning what that library already holds, and `concept_save_path` is where the run
+writes. Load and save are independent, so nothing is inferred from the other — to continue
+an interrupted run, to add concepts to a finished one, or to run inference in a separate
+invocation, set `load_concept_checkpoint` to `runs/<run_name>/concept_library.pt`. The
+metric files are then appended to; with `None` they are rewritten and the harness warns
+first. Neither path may point inside SPL's tree (`assert_not_spl_library`).
 
 ## Layout
 
@@ -90,9 +97,29 @@ common/            shared spine, reused by the VLA/ and neurosymbolic/ baselines
 VLM/cap/           Code-as-Policies
 VLM/demo2code/     Demo2Code (our adapter)
 VLM/saycan/        SayCan: step-by-step primitives, no program
+symbolic/          the search baselines: DreamCoder (B3-a) and LILO (B3-b)
+                   read in this order -- each file depends only on the ones above it
+  lattice.py       the DSL's semantics as pure functions over an immutable state
+  gaussian.py      the same semantics over SPL's probabilistic focus (mean + covariance)
+  ir.py            the Term ADT that is searched, and the grammar levels
+  oracles.py       a hand-written reference term per concept -- a test fixture, not pipeline
+  bridge.py        DreamCoder types/primitives/grammar, and Term <-> Program
+  lower.py         a found Term -> the Python concept class SPL's metrics score
+  srn.py           the placement primitive's per-direction Gaussian, as a lookup table
+  tasks.py         demonstrations -> synthesis tasks; demo selection
+  evaluate.py      how a candidate is judged correct (exact / tolerance / SRN likelihood)
+  search.py        the wake phase: enumerate, score, keep frontiers
+  stitch_bridge.py STITCH compression and grammar re-weighting (Sleep-G)
+  recognition.py   the neural recognition model and dreaming (Sleep-R)
+  driver.py        the wake/sleep loop that drives all of the above
+  harness.py       plugs the loop into SPL's metrics, resume and saving
+  lilo/            B3-b's three additions: proposer, namer, prompts, harness
+  _dreamcoder.py   import shim; keeps Primitive.GLOBALS clean (scaffolding, not pipeline)
 third_party/
   demo2code/       the authors' clone, UNTOUCHED, pinned as a git submodule
+  lilo/            the LILO/DreamCoder clone, UNTOUCHED, pinned as a git submodule
 tests/             regression tests (see "Tests" below)
+  goldens/         recorded artifacts a refactor must reproduce
 runs/<config>_<baseline>/   outputs: concept_library.pt, training_metrics.json,
                    inference_metrics.json, learning_times.json, llm_cache/,
                    sketch_cache/, demo2code_artifacts/
@@ -114,8 +141,10 @@ shimmed out rather than imported — it star-imports `shapely`/`astunparse` pure
 CaP machinery we reimplement in `VLM/cap/fgen.py`.
 
 **Fairness invariants**, all enforced by `tests/test_leakage.py`:
-- A baseline may only resume from its own library; `assert_not_spl_library` refuses any
-  checkpoint inside SPL's tree, so no baseline inherits SPL's learned concepts.
+- A baseline may only load from, and save to, its own library; `assert_not_spl_library`
+  refuses either path inside SPL's tree, so no baseline inherits SPL's learned concepts
+  and none can write over them. `BaselineConfig` declares both rather than inheriting
+  them, because `SPLConfig`'s defaults name SPL's own run directory.
 - Each variant gets a private `SketchAgent` cache; `BaselineConfig` also deep-copies
   `evaluation_config` and `generalize_config`, because `SPLConfig` otherwise shares one
   instance of each and an override would silently reconfigure SPL itself.
@@ -140,14 +169,24 @@ stage receives. It is rendered by SPL's own `GeneralizeAgent._render_library_con
 the concepts its plans actually called; a baseline has no plans, so it gets the whole
 library, which is the generous direction.
 
-**No execution-grounded verification for baselines.** They retry on parse/structure
-failure only. SPL's `_build_concept_class_evaluator` loop stays an SPL contribution.
+**Execution-grounded verification is off by default.** Baselines retry on parse/structure
+failure only; SPL's `_build_concept_class_evaluator` loop stays an SPL contribution.
+`use_evaluator_feedback = True` is the ablation (`common/evaluator.py`). Each class runs on
+the demonstrations and the retry gets SPL's report: crash, block count, per-block distance
+to the demo's final state, bookkeeping. A class passes when every block is within
+`sketch_val_state_error_threshold`. SPL's reward and its MCTS-plan reference are not given,
+because they come from the Plan stage. Image-only variants get the report without distances.
+It needs `sketch_mode="corrected"` and `use_demo=True`, and SayCan ignores it. The outcome is
+recorded as `evaluator` in `training_metrics.json`.
 
 ## Model parity
 
-Pinned in each config file as `CODEGEN_MODEL` / `VLM_MODEL`, currently `gpt-5.4`.
+Pinned in each config file as `CODEGEN_MODEL` / `VLM_MODEL`. `BaselineConfig.from_run_config`
+compares `codegen_model` and `vlm_model` with SPL's `GeneralizeConfig.llm_model`. On a mismatch
+it warns and asks you to type `yes`; any other answer, or no terminal to answer from
+(background run, pytest), stops the run.
 `PARITY_CRITICAL` in `common/config.py` — `concepts`, `num_demos_per_concept`,
-`codegen_model`, `vlm_model`, `max_code_retries` — must be identical across baselines;
+`codegen_model`, `vlm_model`, `max_code_retries`, `use_evaluator_feedback` — must be identical across baselines;
 `assert_parity` refuses to build a config whose baseline class overrides one. That list
 lives in `common/` rather than the config files so it cannot drift between experiments.
 
@@ -160,6 +199,36 @@ lives in `common/` rather than the config files so it cannot drift between exper
 `service_tier` applies to every LLM and VLM call. `"flex"` is cheaper but requests queue,
 so a run can sit idle for a long time before anything happens; `"default"` is standard
 processing. If a run seems hung with no output, check this first.
+
+## Concept anonymisation
+
+`SPLConfig.concept_name` (`"normal"` | `"reversed"` | `"randomized"`) renames the concept
+inside every language instruction, to ask whether a program came from the demonstration or
+from the model's prior on the word "tower". See `overview.md` for the mechanism.
+
+Set it in `SPL/config/spl_config.py` and nowhere else: `BaselineConfig` subclasses `SPLConfig`,
+and the sketch agent scopes its cache directory from the same global, so every baseline shares
+one value by construction. That is why it is **not** in `PARITY_CRITICAL` — that list is
+compared against `CommonConfig`, which is standalone and does not declare it.
+A run whose mode is not `"normal"` gets an `_anon<mode>` suffix on its run directory, so a
+natural and an anonymised run never share a `plan_library.json`, a sketch cache or an
+`llm_cache`.
+
+What each baseline actually sees:
+
+- **CaP, Demo2Code, SayCan** — anonymised end to end, with no baseline-side code. They read
+  `language_instruction` from the same dataloader the rewrite hooks into, and their records are
+  already keyed by the dataset concept with `pred_concept` alongside.
+- **B3-b (LILO)** — the proposer, the LLM that writes programs, reads `task.instruction` and is
+  anonymised with them. The **namer** needed fixing: it renders each usage as
+  `building a <task name>`, and task names are the dataset's concept however the instruction was
+  rewritten. Its names become the library documentation that later proposer prompts carry, so
+  the leak propagated. `search.alias_task_name` now aliases what is rendered; `SearchTask.name`,
+  `_record_program`, `_score_window` and `heldout`'s `PROGRAM_LIB` lookups keep natural names.
+- **B3-a (DreamCoder)** — **the ablation is vacuous for it, by construction.** It reads no
+  language at all; the only model anywhere near it is the shared sketch agent, which supplies
+  the concept and argument name and does receive the anonymised instruction. Report B3-a's
+  anonymised numbers as unchanged-by-design rather than as a null result.
 
 ## Known behaviour worth knowing
 
@@ -182,8 +251,11 @@ processing. If a run seems hung with no output, check this first.
   `[Scenario i]` and `State 2:` for scenarios after the first.
 - With `sketch_mode="none"` the model names the class itself, so the registered name can
   differ from the dataset's. Records are keyed by the **dataset** concept with the
-  registered one alongside as `pred_concept` — that keeps resume's skip working and lets
-  the metric files still diff against SPL's. A demonstration whose instruction will not
+  registered one alongside as `pred_concept` — that lets the metric files still diff
+  against SPL's, and lets a record survive pruning through the name actually registered.
+  Whether a concept is learned again is decided from the library alone, exactly as
+  `learn_spl_concept` decides it, so a concept registered under an invented name is not
+  recognised and is relearned. A demonstration whose instruction will not
   ground onto the registered class is dropped with a warning (`partially_grounded`), never
   by failing the run.
 - `validate_and_correct_sketch` returns unchanged, with no LLM call, when the demos already
@@ -215,14 +287,36 @@ processing. If a run seems hung with no output, check this first.
 ## Tests
 
 ```
+python -m pytest baseline_spl/tests/ -q       # everything, ~7 minutes
+```
+
+Standalone entry points, for the ones that also print a report:
+
+```
 python -m baseline_spl.tests.test_leakage     # fairness invariants, per-demo prompt content
 python -m baseline_spl.tests.test_serialize   # direction mapping, SRN agreement, both coordinate modes
-python -m baseline_spl.tests.test_resume      # which library gets loaded; metric merging
+python -m baseline_spl.tests.test_resume      # which library gets loaded; metric merging and pruning
 python -m baseline_spl.tests.test_saycan      # flat-plan scoring and all three stop conditions
+python -m baseline_spl.tests.test_ir_fidelity # every oracle reproduces run_gt_program, n = 1..12
+python -m baseline_spl.tests.test_bridge      # Term <-> Program round trip; no foreign primitives
 ```
+
+The symbolic baselines add: `test_ir_fidelity`, `test_lowering`, `test_bridge`, `test_tasks`,
+`test_stitch_bridge`, `test_search_parallel`, `test_recognition`, `test_gaussian`, `test_lilo`.
 
 `test_serialize` is the important one: it guards constants that, if wrong, silently make
 every baseline look worse than it is.
 
-Note both `common/harness.py` and `VLM/cap/run.py` currently contain a `breakpoint()`.
-Run with `PYTHONBREAKPOINT=0` for anything unattended.
+**A passing suite is not sufficient evidence that a change is safe.** Twice now a regression
+has exited 0 and passed every test: a metric silently became `None`, and the recognition model
+trained for 45 gradient steps instead of 10,000. For anything touching `symbolic/`, also diff
+the run artifacts against the recorded goldens:
+
+```
+BASELINE_CONFIG=determinism_pin python -m baseline_spl.symbolic.dreamcoder.run
+python -m baseline_spl.tests.compare_artifacts \
+    runs/determinism_pin_dreamcoder_standard_maha2 tests/goldens/determinism_pin
+```
+
+`determinism_pin` ends its search on the MDL band rather than the clock, so it is reproducible
+run to run; the smoke configs are clock-bound, so compare those with `--clock-bound`.
